@@ -17,6 +17,7 @@ permissions:
 
 jobs:
   review:
+    if: github.repository == 'codegraph-ai/CodeGraph'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (full history)
