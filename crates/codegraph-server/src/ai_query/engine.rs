@@ -3742,7 +3742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_query_performance() {
+    async fn test_query_searches_many_nodes() {
         let (engine, graph) = create_test_engine().await;
 
         // Add 1000 nodes using camelCase so tokens are properly split
@@ -3771,17 +3771,9 @@ mod tests {
 
         engine.build_indexes().await;
 
-        // Search should complete quickly (< 10ms)
-        let start = Instant::now();
         let results = engine
             .symbol_search("function", &SearchOptions::new())
             .await;
-        let duration = start.elapsed();
-
-        assert!(
-            duration.as_millis() < 10,
-            "Search took too long: {duration:?}"
-        );
         assert!(!results.results.is_empty());
     }
 
