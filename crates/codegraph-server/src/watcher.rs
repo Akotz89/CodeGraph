@@ -10,7 +10,7 @@ use crate::memory::MemoryManager;
 use crate::parser_registry::ParserRegistry;
 use codegraph::CodeGraph;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -227,6 +227,7 @@ impl FileWatcher {
 
             // Remove existing nodes for this file
             Self::remove_file_nodes(&mut graph, path)?;
+            GraphUpdater::resolve_sql_table_references(&mut graph);
 
             // Parse and add new nodes
             let file_info = parser.parse_source(&content, path, &mut graph)?;
@@ -375,7 +376,7 @@ impl GraphUpdater {
     /// This should be called after any parse operation to ensure cross-file
     /// imports are properly resolved.
     pub fn resolve_cross_file_imports(graph: &mut CodeGraph) {
-        use codegraph::{Direction, EdgeType, NodeType, PropertyMap};
+        use codegraph::{EdgeType, NodeType, PropertyMap};
 
         // Collect all file nodes and their import edges
         let file_nodes: Vec<_> = graph
@@ -433,56 +434,33 @@ impl GraphUpdater {
             }
         }
 
-        // Process each file's outgoing import edges
+        // Process import edges in one pass. `get_edges_between(source, target)`
+        // scans all outgoing edges for the source; repeating it for each
+        // neighbour of a bulk SQL file makes this loop quadratic.
         let mut edges_to_add: Vec<(codegraph::NodeId, codegraph::NodeId, PropertyMap)> = Vec::new();
+        let file_node_ids: HashSet<_> = file_nodes.into_iter().collect();
+        let mut linked_pairs: HashSet<_> = graph
+            .iter_edges()
+            .filter_map(|(_, edge)| {
+                (edge.edge_type == EdgeType::Imports && file_node_ids.contains(&edge.source_id))
+                    .then_some((edge.source_id, edge.target_id))
+            })
+            .collect();
 
-        for file_id in file_nodes {
-            // Get outgoing edges from this file
-            if let Ok(neighbors) = graph.get_neighbors(file_id, Direction::Outgoing) {
-                for neighbor_id in neighbors {
-                    // Check if this is an import edge
-                    if let Ok(edge_ids) = graph.get_edges_between(file_id, neighbor_id) {
-                        for edge_id in edge_ids {
-                            if let Ok(edge) = graph.get_edge(edge_id) {
-                                if edge.edge_type == EdgeType::Imports {
-                                    // Check if this edge has symbols that we can resolve
-                                    if let Some(symbols) =
-                                        edge.properties.get_string_list_compat("symbols")
-                                    {
-                                        for symbol in &symbols {
-                                            let symbol = symbol.as_str();
-                                            // Look up the symbol in our map
-                                            if let Some(&symbol_id) = symbol_map.get(symbol) {
-                                                // Check if we already have an edge to this symbol
-                                                let already_linked = graph
-                                                    .get_edges_between(file_id, symbol_id)
-                                                    .map(|edges| {
-                                                        edges.iter().any(|e| {
-                                                            graph
-                                                                .get_edge(*e)
-                                                                .map(|edge| {
-                                                                    edge.edge_type
-                                                                        == EdgeType::Imports
-                                                                })
-                                                                .unwrap_or(false)
-                                                        })
-                                                    })
-                                                    .unwrap_or(false);
-
-                                                if !already_linked {
-                                                    let props = PropertyMap::new()
-                                                        .with("imported_symbol", symbol)
-                                                        .with(
-                                                            "resolved_by",
-                                                            "cross_file_resolution",
-                                                        );
-                                                    edges_to_add.push((file_id, symbol_id, props));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+        for (_, edge) in graph.iter_edges() {
+            let file_id = edge.source_id;
+            if edge.edge_type != EdgeType::Imports || !file_node_ids.contains(&file_id) {
+                continue;
+            }
+            if let Some(symbols) = edge.properties.get_string_list_compat("symbols") {
+                for symbol in &symbols {
+                    let symbol = symbol.as_str();
+                    if let Some(&symbol_id) = symbol_map.get(symbol) {
+                        if linked_pairs.insert((file_id, symbol_id)) {
+                            let props = PropertyMap::new()
+                                .with("imported_symbol", symbol)
+                                .with("resolved_by", "cross_file_resolution");
+                            edges_to_add.push((file_id, symbol_id, props));
                         }
                     }
                 }
@@ -593,6 +571,83 @@ impl GraphUpdater {
         for (from_id, to_id, props) in ref_edges_to_add {
             let _ = graph.add_edge(from_id, to_id, EdgeType::References, props);
         }
+
+        Self::resolve_sql_table_references(graph);
+    }
+
+    /// Link unqualified SQL references only within an unambiguous database scope.
+    pub fn resolve_sql_table_references(graph: &mut CodeGraph) {
+        let scopes: std::collections::HashMap<String, String> = match std::env::var("CODEGRAPH_SQL_SCOPE_MAP") {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|_| {
+                tracing::warn!("Invalid SQL scope map; cross-root links are disabled");
+                Default::default()
+            }),
+            Err(_) => Default::default(),
+        };
+        Self::resolve_sql_table_references_with_scopes(graph, &scopes);
+    }
+
+    fn resolve_sql_table_references_with_scopes(
+        graph: &mut CodeGraph,
+        scopes: &std::collections::HashMap<String, String>,
+    ) {
+        use codegraph::{EdgeType, NodeId, PropertyMap};
+        use std::collections::HashMap;
+
+        fn identity(path: &str, name: &str) -> Option<(String, String, String, bool)> {
+            let (root, tail) = path.split_once("/data/sql/")?;
+            let mut parts = tail.split('/');
+            let first = parts.next()?;
+            let second = parts.next()?;
+            let (stage, database) = if matches!(first, "base" | "updates" | "archive" | "old") {
+                (first, second.strip_prefix("pending_").unwrap_or(second))
+            } else {
+                let database = match first {
+                    "world" | "db-world" => "db_world", "auth" | "db-auth" => "db_auth",
+                    "characters" | "db-characters" => "db_characters", "playerbots" => "db_playerbots",
+                    _ => return None,
+                };
+                (if second.ends_with(".sql") { "updates" } else { second }, database)
+            };
+            if !matches!(stage, "base" | "updates" | "archive" | "old") ||
+                !matches!(database, "db_world" | "db_auth" | "db_characters" | "db_playerbots") { return None; }
+            let name = name.trim_matches('`').to_ascii_lowercase();
+            if name.is_empty() || name.contains('.') || name.contains('`') { return None; }
+            Some((root.to_owned(), database.to_owned(), name, stage == "base"))
+        }
+
+        let obsolete: Vec<_> = graph.iter_edges().filter_map(|(id, edge)| {
+            (edge.properties.get_string("resolved_by") == Some("sql_database_scope")).then_some(id)
+        }).collect();
+        for id in obsolete {
+            if let Err(error) = graph.delete_edge(id) {
+                tracing::error!("Failed to clear inferred SQL edge: {}", error);
+                return;
+            }
+        }
+
+        let mut definitions: HashMap<(String, String, String), Vec<NodeId>> = HashMap::new();
+        let mut references = Vec::new();
+        for (id, node) in graph.iter_nodes() {
+            let (Some(kind), Some(path), Some(name)) = (node.properties.get_string("kind"), node.properties.get_string("path"), node.properties.get_string("name")) else { continue; };
+            if !matches!(kind, "table" | "table_reference") { continue; }
+            let Some((root, database, name, base)) = identity(path, name) else { continue; };
+            let scope = match scopes.get(&root) {
+                Some(group) if !group.is_empty() => format!("group:{group}"),
+                _ => format!("root:{root}"),
+            };
+            let key = (scope, database, name);
+            if kind == "table" && base { definitions.entry(key).or_default().push(id); }
+            else if kind == "table_reference" || (kind == "table" && !base) { references.push((id, key)); }
+        }
+        for (reference, key) in references {
+            if let Some([definition]) = definitions.get(&key).map(Vec::as_slice) {
+                if let Err(error) = graph.add_edge(reference, *definition, EdgeType::References,
+                    PropertyMap::new().with("resolved_by", "sql_database_scope")) {
+                    tracing::error!("Failed to add inferred SQL edge: {}", error);
+                }
+            }
+        }
     }
 }
 
@@ -641,6 +696,60 @@ impl BatchUpdateResult {
 mod tests {
     use super::*;
     use crate::domain::node_props;
+
+    #[test]
+    fn sql_links_are_scoped_unambiguous_and_reconciled() {
+        use codegraph::{EdgeType, NodeType, PropertyMap};
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let mut node = |kind: &str, path: &str, name: &str| graph.add_node(NodeType::Generic,
+            PropertyMap::new().with("kind", kind).with("path", path).with("name", name)).unwrap();
+        let world = node("table", "/repo/data/sql/base/db_world/things.sql", "`things`");
+        let auth = node("table", "/repo/data/sql/base/db_auth/things.sql", "`things`");
+        let reference = node("table_reference", "/repo/data/sql/updates/db_world/001.sql", "`things`");
+        let other_root = node("table_reference", "/other/data/sql/updates/db_world/001.sql", "things");
+        let qualified = node("table_reference", "/repo/data/sql/updates/db_world/002.sql", "auth.things");
+        let unknown = node("table_reference", "/repo/data/sql/custom/db_world/003.sql", "things");
+        let pending = node("table_reference", "/repo/data/sql/updates/pending_db_world/004.sql", "things");
+        let bots = node("table", "/module/data/sql/playerbots/base/things.sql", "things");
+        let bot_ref = node("table_reference", "/module/data/sql/playerbots/updates/001.sql", "things");
+        let module_world = node("table_reference", "/module/data/sql/world/updates/001.sql", "things");
+        let hyphen_world = node("table", "/module/data/sql/db-world/base/things.sql", "things");
+        let hyphen_ref = node("table_reference", "/module/data/sql/db-world/updates/001.sql", "things");
+        let direct_ref = node("table_reference", "/module/data/sql/db-world/update.sql", "things");
+        let update_definition = node("table", "/module/data/sql/db-world/updates/002.sql", "things");
+        GraphUpdater::resolve_sql_table_references(&mut graph);
+        GraphUpdater::resolve_sql_table_references(&mut graph);
+        let edges = graph.get_edges_between(reference, world).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(graph.get_edge(edges[0]).unwrap().edge_type, EdgeType::References);
+        assert!(graph.get_edges_between(reference, auth).unwrap().is_empty());
+        assert!(graph.get_edges_between(other_root, world).unwrap().is_empty());
+        assert!(graph.get_edges_between(qualified, world).unwrap().is_empty());
+        assert!(graph.get_edges_between(unknown, world).unwrap().is_empty());
+        assert_eq!(graph.get_edges_between(pending, world).unwrap().len(), 1);
+        assert_eq!(graph.get_edges_between(bot_ref, bots).unwrap().len(), 1);
+        assert!(graph.get_edges_between(module_world, bots).unwrap().is_empty());
+        assert_eq!(graph.get_edges_between(hyphen_ref, hyphen_world).unwrap().len(), 1);
+        assert_eq!(graph.get_edges_between(module_world, hyphen_world).unwrap().len(), 1);
+        assert_eq!(graph.get_edges_between(direct_ref, hyphen_world).unwrap().len(), 1);
+        assert_eq!(graph.get_edges_between(update_definition, hyphen_world).unwrap().len(), 1);
+        let scopes = std::collections::HashMap::from([
+            ("/repo".to_string(), "project".to_string()),
+            ("/other".to_string(), "project".to_string()),
+        ]);
+        GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &scopes);
+        assert_eq!(graph.get_edges_between(other_root, world).unwrap().len(), 1);
+        assert!(graph.get_edges_between(other_root, auth).unwrap().is_empty());
+        GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new());
+        assert!(graph.get_edges_between(other_root, world).unwrap().is_empty());
+        let duplicate = graph.add_node(NodeType::Generic, PropertyMap::new().with("kind", "table")
+            .with("path", "/repo/data/sql/base/db_world/other.sql").with("name", "things")).unwrap();
+        GraphUpdater::resolve_sql_table_references(&mut graph);
+        assert!(graph.get_edges_between(reference, world).unwrap().is_empty());
+        graph.delete_node(duplicate).unwrap();
+        GraphUpdater::resolve_sql_table_references(&mut graph);
+        assert_eq!(graph.get_edges_between(reference, world).unwrap().len(), 1);
+    }
 
     // Helper to create a mock FileInfo using GraphUpdater
     async fn create_file_info_via_update(

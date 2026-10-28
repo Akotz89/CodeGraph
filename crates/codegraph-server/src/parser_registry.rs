@@ -3,6 +3,8 @@
 
 //! Parser Registry - Manages all language parsers implementing the CodeParser trait.
 
+use crate::build_parser::BuildParser;
+use crate::sql_parser::SqlParser;
 use codegraph::CodeGraph;
 use codegraph_bash::BashParser;
 use codegraph_c::CParser;
@@ -51,10 +53,31 @@ use codegraph_yaml::YamlParser;
 use codegraph_zig::ZigParser;
 use std::path::Path;
 use std::sync::Arc;
+use std::io::Read;
+
+/// Recognize only known extensionless build files or a bounded interpreter shebang.
+pub(crate) fn extensionless_source_kind(path: &Path) -> Option<&'static str> {
+    if path.extension().is_some() { return None; }
+    match path.file_name()?.to_str()? {
+        "Dockerfile" => return Some("dockerfile"),
+        "Makefile" => return Some("makefile"),
+        _ => {}
+    }
+    let mut bytes = [0u8; 256];
+    let count = std::fs::File::open(path).ok()?.read(&mut bytes).ok()?;
+    let end = bytes[..count].iter().position(|b| *b == b'\n').unwrap_or(count);
+    let first = std::str::from_utf8(&bytes[..end]).ok()?;
+    let command = first.strip_prefix("#!")?.trim();
+    let words: Vec<_> = command.split_whitespace().collect();
+    let executable = Path::new(*words.first()?).file_name()?.to_str()?;
+    let interpreter = if executable == "env" { *words.get(1)? } else { executable };
+    match interpreter { "bash" | "sh" => Some("bash"), "python" | "python3" => Some("python"), "make" => Some("makefile"), _ => None }
+}
 
 /// Registry of all available language parsers.
 pub struct ParserRegistry {
     bash: Arc<BashParser>,
+    build: Arc<BuildParser>,
     c: Arc<CParser>,
     clojure: Arc<ClojureParser>,
     #[cfg(feature = "extra-languages")]
@@ -90,6 +113,7 @@ pub struct ParserRegistry {
     rust: Arc<RustParser>,
     scala: Arc<ScalaParser>,
     solidity: Arc<SolidityParser>,
+    sql: Arc<SqlParser>,
     swift: Arc<SwiftParser>,
     tcl: Arc<TclParser>,
     toml: Arc<TomlParser>,
@@ -110,6 +134,7 @@ impl ParserRegistry {
     pub fn with_config(config: ParserConfig) -> Self {
         Self {
             bash: Arc::new(BashParser::with_config(config.clone())),
+            build: Arc::new(BuildParser::with_config(config.clone())),
             c: Arc::new(CParser::with_config(config.clone())),
             clojure: Arc::new(ClojureParser::with_config(config.clone())),
             #[cfg(feature = "extra-languages")]
@@ -145,6 +170,7 @@ impl ParserRegistry {
             rust: Arc::new(RustParser::with_config(config.clone())),
             scala: Arc::new(ScalaParser::with_config(config.clone())),
             solidity: Arc::new(SolidityParser::with_config(config.clone())),
+            sql: Arc::new(SqlParser::with_config(config.clone())),
             swift: Arc::new(SwiftParser::with_config(config.clone())),
             tcl: Arc::new(TclParser::with_config(config.clone())),
             toml: Arc::new(TomlParser::with_config(config.clone())),
@@ -160,6 +186,7 @@ impl ParserRegistry {
     pub fn get_parser(&self, language: &str) -> Option<Arc<dyn CodeParser>> {
         match language.to_lowercase().as_str() {
             "bash" | "shell" | "sh" => Some(self.bash.clone()),
+            "build" | "cmake" | "bats" => Some(self.build.clone()),
             "c" => Some(self.c.clone()),
             "clojure" => Some(self.clojure.clone()),
             #[cfg(feature = "extra-languages")]
@@ -195,6 +222,7 @@ impl ParserRegistry {
             "rust" => Some(self.rust.clone()),
             "scala" => Some(self.scala.clone()),
             "solidity" | "sol" => Some(self.solidity.clone()),
+            "sql" | "mysql" => Some(self.sql.clone()),
             "swift" => Some(self.swift.clone()),
             "tcl" => Some(self.tcl.clone()),
             "toml" => Some(self.toml.clone()),
@@ -215,9 +243,19 @@ impl ParserRegistry {
     /// C++-specific extensions (`.hpp`, `.cc`, `.cxx`, `.hh`, `.hxx`) are
     /// only claimed by the C++ parser and resolve correctly.
     pub fn parser_for_path(&self, path: &Path) -> Option<Arc<dyn CodeParser>> {
+        if let Some(kind) = extensionless_source_kind(path) {
+            return match kind {
+                "bash" => Some(self.bash.clone()),
+                "python" => Some(self.python.clone()),
+                "makefile" => Some(self.build.clone()),
+                "dockerfile" => Some(self.dockerfile.clone()),
+                _ => None,
+            };
+        }
         #[cfg_attr(not(feature = "extra-languages"), allow(unused_mut))]
         let mut parsers: Vec<Arc<dyn CodeParser>> = vec![
             self.bash.clone(),
+            self.build.clone(),
             self.c.clone(),
             self.clojure.clone(),
             self.cpp.clone(),
@@ -243,6 +281,7 @@ impl ParserRegistry {
             self.rust.clone(),
             self.scala.clone(),
             self.solidity.clone(),
+            self.sql.clone(),
             self.swift.clone(),
             self.tcl.clone(),
             self.toml.clone(),
@@ -273,6 +312,7 @@ impl ParserRegistry {
     pub fn supported_extensions(&self) -> Vec<&str> {
         let mut extensions = Vec::new();
         extensions.extend(self.bash.file_extensions().iter().copied());
+        extensions.extend(self.build.file_extensions().iter().copied());
         extensions.extend(self.c.file_extensions().iter().copied());
         extensions.extend(self.clojure.file_extensions().iter().copied());
         #[cfg(feature = "extra-languages")]
@@ -308,6 +348,7 @@ impl ParserRegistry {
         extensions.extend(self.rust.file_extensions().iter().copied());
         extensions.extend(self.scala.file_extensions().iter().copied());
         extensions.extend(self.solidity.file_extensions().iter().copied());
+        extensions.extend(self.sql.file_extensions().iter().copied());
         extensions.extend(self.swift.file_extensions().iter().copied());
         extensions.extend(self.tcl.file_extensions().iter().copied());
         extensions.extend(self.toml.file_extensions().iter().copied());
@@ -324,6 +365,7 @@ impl ParserRegistry {
         #[cfg_attr(not(feature = "extra-languages"), allow(unused_mut))]
         let mut metrics: Vec<(&str, ParserMetrics)> = vec![
             ("bash", self.bash.metrics()),
+            ("build", self.build.metrics()),
             ("c", self.c.metrics()),
             ("clojure", self.clojure.metrics()),
             ("cpp", self.cpp.metrics()),
@@ -349,6 +391,7 @@ impl ParserRegistry {
             ("rust", self.rust.metrics()),
             ("scala", self.scala.metrics()),
             ("solidity", self.solidity.metrics()),
+            ("sql", self.sql.metrics()),
             ("swift", self.swift.metrics()),
             ("tcl", self.tcl.metrics()),
             ("toml", self.toml.metrics()),
@@ -379,6 +422,15 @@ impl ParserRegistry {
             ParserError::UnsupportedFeature(path.to_path_buf(), "Unsupported file type".to_string())
         })?;
 
+        if extensionless_source_kind(path) == Some("python") {
+            let metadata = std::fs::metadata(path).map_err(|error| ParserError::IoError(path.to_path_buf(), error))?;
+            if metadata.len() > parser.config().max_file_size as u64 {
+                return Err(ParserError::FileTooLarge(path.to_path_buf(), usize::try_from(metadata.len()).unwrap_or(usize::MAX)));
+            }
+            let source = std::fs::read_to_string(path).map_err(|error| ParserError::IoError(path.to_path_buf(), error))?;
+            return parser.parse_source(&source, path, graph);
+        }
+
         parser.parse_file(path, graph)
     }
 
@@ -401,6 +453,19 @@ impl ParserRegistry {
     /// Note: `.h` files return `"c"` by convention (C-compatible headers).
     /// Use `.hpp`/`.hh`/`.hxx` for C++ headers.
     pub fn language_for_path(&self, path: &Path) -> Option<&'static str> {
+        if self.build.can_parse(path) {
+            return Some(match path.extension().and_then(|e| e.to_str()) {
+                Some("bats") => "bats",
+                Some("bat") => "batch",
+                Some("html") => "html",
+                Some("am") => "automake",
+                Some("ac") => "autoconf",
+                Some("rc") => "winresource",
+                Some("json") => "json",
+                Some("conf" | "dist") => "config",
+                _ => "cmake",
+            });
+        }
         // Note: C is checked before C++ so `.h` files default to C parsing.
         if self.c.can_parse(path) {
             if self.cpp.can_parse(path) {
@@ -461,6 +526,8 @@ impl ParserRegistry {
             Some("scala")
         } else if self.solidity.can_parse(path) {
             Some("solidity")
+        } else if self.sql.can_parse(path) {
+            Some("sql")
         } else if self.swift.can_parse(path) {
             Some("swift")
         } else if self.tcl.can_parse(path) {
@@ -522,6 +589,17 @@ impl Default for ParserRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extensionless_python_shebang_is_parsed_at_the_original_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mpq-info");
+        std::fs::write(&path, "#!/usr/bin/env python\ndef inspect_archive():\n    return True\n").unwrap();
+        let registry = ParserRegistry::new();
+        let mut graph = CodeGraph::in_memory().unwrap();
+        registry.parse_file(&path, &mut graph).unwrap();
+        assert!(graph.iter_nodes().any(|(_, n)| n.properties.get_string("name") == Some("inspect_archive") && n.properties.get_string("path") == path.to_str()));
+    }
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
@@ -750,6 +828,7 @@ mod tests {
         assert!(registry.can_parse(Path::new("test.rb")));
         assert!(registry.can_parse(Path::new("test.rs")));
         assert!(registry.can_parse(Path::new("test.sv")));
+        assert!(registry.can_parse(Path::new("migration.sql")));
         assert!(registry.can_parse(Path::new("test.swift")));
         assert!(registry.can_parse(Path::new("test.tcl")));
         assert!(registry.can_parse(Path::new("test.ts")));
@@ -775,6 +854,7 @@ mod tests {
         #[cfg_attr(not(feature = "extra-languages"), allow(unused_mut))]
         let mut expected = vec![
             "bash",
+            "build",
             "c",
             "clojure",
             "cpp",
@@ -800,6 +880,7 @@ mod tests {
             "rust",
             "scala",
             "solidity",
+            "sql",
             "swift",
             "tcl",
             "toml",
@@ -820,6 +901,10 @@ mod tests {
         assert_eq!(
             registry.language_for_path(&PathBuf::from("test.c")),
             Some("c")
+        );
+        assert_eq!(
+            registry.language_for_path(&PathBuf::from("migration.sql")),
+            Some("sql")
         );
         assert_eq!(
             registry.language_for_path(&PathBuf::from("test.h")),
@@ -957,6 +1042,58 @@ mod tests {
         writeln!(temp_file, "def test_function():\n    pass").unwrap();
         let result = registry.parse_file(temp_file.path(), &mut graph);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn c_family_parsers_decode_iso_8859_source_and_keep_line_locations() {
+        let registry = ParserRegistry::new();
+        for suffix in ["h", "cpp"] {
+            let mut file = NamedTempFile::with_suffix(&format!(".{suffix}")).unwrap();
+            file.write_all(b"/* Copyright \xa9 */\nint encoding_probe(void) { return 1; }\n")
+                .unwrap();
+            let raw_size = file.as_file().metadata().unwrap().len() as usize;
+            let mut graph = CodeGraph::in_memory().unwrap();
+            let info = registry.parse_file(file.path(), &mut graph).unwrap();
+            let function = graph.get_node(info.functions[0]).unwrap();
+            assert_eq!(
+                function.properties.get_string("name"),
+                Some("encoding_probe")
+            );
+            assert_eq!(function.properties.get_int("line_start"), Some(2));
+            assert_eq!(info.byte_count, raw_size);
+            assert_eq!(std::fs::read(file.path()).unwrap()[13], 0xa9);
+        }
+    }
+
+    #[test]
+    fn c_family_parsers_refuse_ambiguous_non_utf8_source_explicitly() {
+        let registry = ParserRegistry::new();
+        let mut file = NamedTempFile::with_suffix(".cpp").unwrap();
+        file.write_all(b"// ambiguous \x93 byte\nint probe();\n")
+            .unwrap();
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let error = registry.parse_file(file.path(), &mut graph).unwrap_err();
+        assert!(error.to_string().contains("unsupported source encoding"));
+        assert_eq!(graph.node_count(), 0);
+        assert_eq!(std::fs::read(file.path()).unwrap()[13], 0x93);
+    }
+
+    #[test]
+    fn test_parse_source_routes_sql_to_registered_parser() {
+        let registry = ParserRegistry::new();
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let result = registry
+            .parse_source(
+                "CREATE TABLE `registered_sql` (id INT PRIMARY KEY);",
+                Path::new("migration.sql"),
+                &mut graph,
+            )
+            .unwrap();
+        assert_eq!(result.file_path, PathBuf::from("migration.sql"));
+        assert!(graph.iter_nodes().any(|(_, node)| {
+            node.properties.get_string("kind") == Some("table")
+                && node.properties.get_string("name") == Some("`registered_sql`")
+        }));
     }
 
     #[test]

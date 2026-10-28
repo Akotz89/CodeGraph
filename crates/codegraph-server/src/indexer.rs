@@ -9,11 +9,74 @@
 
 use crate::index_state::IndexState;
 use crate::parser_registry::ParserRegistry;
+use crate::sql_parser::{is_sql_path, MAX_SQL_FILE_SIZE_BYTES};
 use crate::watcher::GraphUpdater;
 use codegraph::CodeGraph;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+
+/// Resolve an existing path to its canonical identity, or retain missing
+/// descendants beneath the nearest canonical existing ancestor. The latter
+/// keeps exact include identity stable while one or more parent directories
+/// are temporarily deleted.
+pub(crate) fn canonical_candidate(path: &Path) -> Option<PathBuf> {
+    if let Ok(canonical) = path.canonicalize() {
+        return Some(canonical);
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut missing = Vec::new();
+    let mut ancestor = absolute.as_path();
+    while !ancestor.exists() {
+        missing.push(ancestor.file_name()?.to_os_string());
+        ancestor = ancestor.parent()?;
+    }
+    let mut resolved = ancestor.canonicalize().ok()?;
+    for component in missing.into_iter().rev() {
+        resolved.push(component);
+    }
+    Some(resolved)
+}
+
+/// Read a file for indexing while keeping the SQL parser's larger-file policy
+/// bounded at the indexer's earlier content-hash read as well.
+fn read_index_content(path: &Path) -> Result<Vec<u8>, String> {
+    if !is_sql_path(path) {
+        return std::fs::read(path).map_err(|e| format!("Read error: {e}"));
+    }
+
+    let metadata = std::fs::metadata(path).map_err(|e| format!("Read error: {e}"))?;
+    if metadata.len() > MAX_SQL_FILE_SIZE_BYTES {
+        return Err(format!(
+            "SQL file exceeds {} byte limit ({} bytes): {}",
+            MAX_SQL_FILE_SIZE_BYTES,
+            metadata.len(),
+            path.display()
+        ));
+    }
+
+    // Metadata can go stale if a file grows between stat and read. Read at
+    // most one byte beyond the cap so the race cannot turn into an unbounded
+    // allocation before the parser gets a chance to reject it.
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("Read error: {e}"))?;
+    let mut content = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_SQL_FILE_SIZE_BYTES + 1)
+        .read_to_end(&mut content)
+        .map_err(|e| format!("Read error: {e}"))?;
+    if content.len() as u64 > MAX_SQL_FILE_SIZE_BYTES {
+        return Err(format!(
+            "SQL file exceeds {} byte limit: {}",
+            MAX_SQL_FILE_SIZE_BYTES,
+            path.display()
+        ));
+    }
+    Ok(content)
+}
 
 /// Whether one directory entry is excluded from the graph.
 ///
@@ -55,9 +118,13 @@ pub(crate) fn is_excluded_entry(
 /// Built per workspace root because `.codegraphignore` is read per root, as
 /// the indexer does. It is read once, when the watcher starts: editing
 /// `.codegraphignore` takes effect on the next start, like `--exclude`.
+#[derive(Clone)]
 pub(crate) struct WorkspaceFilter {
     /// `(root as given, root canonicalised, config, exclude globs)`.
     roots: Vec<(PathBuf, PathBuf, IndexConfig, globset::GlobSet)>,
+    /// Canonical caller-selected source files. These are exact-file
+    /// exceptions to example/build directory pruning, never directory roots.
+    explicit_files: std::collections::HashSet<PathBuf>,
 }
 
 impl WorkspaceFilter {
@@ -72,7 +139,94 @@ impl WorkspaceFilter {
                 (root.clone(), canonical, config, exclude_set)
             })
             .collect();
-        Self { roots }
+        let explicit_files = base
+            .explicit_source_files
+            .iter()
+            .filter_map(|path| canonical_candidate(path))
+            .collect();
+        Self {
+            roots,
+            explicit_files,
+        }
+    }
+
+    pub(crate) fn explicit_source_files(&self) -> Vec<PathBuf> {
+        self.explicit_files.iter().cloned().collect()
+    }
+
+    pub(crate) fn is_explicit_file(&self, path: &Path) -> bool {
+        canonical_candidate(path).is_some_and(|candidate| self.explicit_files.contains(&candidate))
+    }
+
+    pub(crate) fn admits_explicit_parent(&self, path: &Path) -> bool {
+        let Some(candidate) = canonical_candidate(path) else {
+            return false;
+        };
+        self.explicit_files
+            .iter()
+            .any(|file| file.parent() == Some(candidate.as_path()))
+    }
+
+    /// Whether `path` is a workspace-contained directory on the chain to an
+    /// exact included file. This permits a nonrecursive watch to notice when
+    /// an excluded immediate parent is removed and recreated.
+    pub(crate) fn admits_explicit_ancestor(&self, path: &Path) -> bool {
+        let Some((root, relative, _, _)) = self.locate(path) else {
+            return false;
+        };
+        let candidate = canonical_candidate(path).unwrap_or_else(|| root.join(relative));
+        let canonical_root = root.canonicalize().unwrap_or(root);
+        candidate.starts_with(&canonical_root)
+            && self
+                .explicit_files
+                .iter()
+                .any(|file| file.starts_with(&candidate) && file != &candidate)
+    }
+
+    /// Existing directories on the path from the workspace root to this
+    /// exact file's parent. Watching this chain nonrecursively lets the
+    /// watcher recover if an excluded parent is removed and recreated, while
+    /// never traversing sibling directories.
+    pub(crate) fn explicit_watch_chain(&self, path: &Path) -> Vec<PathBuf> {
+        let Some(file) = canonical_candidate(path) else {
+            return Vec::new();
+        };
+        if !self.explicit_files.contains(&file) || !self.admits(&file) {
+            return Vec::new();
+        }
+        let Some((root, _, _, _)) = self.locate(&file) else {
+            return Vec::new();
+        };
+        let canonical_root = root.canonicalize().unwrap_or(root);
+        let Some(mut directory) = file.parent().map(Path::to_path_buf) else {
+            return Vec::new();
+        };
+        if !directory.starts_with(&canonical_root) {
+            return Vec::new();
+        }
+        let mut chain = Vec::new();
+        loop {
+            if directory.is_dir() {
+                if let Ok(canonical) = directory.canonicalize() {
+                    if canonical.starts_with(&canonical_root) {
+                        chain.push(canonical);
+                    }
+                }
+            }
+            if directory == canonical_root {
+                break;
+            }
+            let Some(parent) = directory.parent() else {
+                return Vec::new();
+            };
+            if !parent.starts_with(&canonical_root) {
+                return Vec::new();
+            }
+            directory = parent.to_path_buf();
+        }
+        chain.reverse();
+        chain.dedup();
+        chain
     }
 
     /// Whether `path`, a file, belongs in the graph.
@@ -85,6 +239,14 @@ impl WorkspaceFilter {
         let Some((root, relative, config, exclude_set)) = self.locate(path) else {
             return false;
         };
+
+        let candidate = root.join(&relative);
+        let is_explicit = self.explicit_files.contains(&candidate)
+            || canonical_candidate(&candidate)
+                .is_some_and(|canonical| self.explicit_files.contains(&canonical));
+        if is_explicit {
+            return self.admits_explicit_file(path, &root, &relative, config, exclude_set);
+        }
 
         let components: Vec<_> = relative.components().collect();
         // Directories above the file, matching the walk's depth accounting.
@@ -102,9 +264,122 @@ impl WorkspaceFilter {
         }
 
         match std::fs::metadata(path) {
-            Ok(metadata) => metadata.len() <= config.max_file_size_bytes,
+            Ok(metadata) => is_sql_path(path) || metadata.len() <= config.max_file_size_bytes,
             Err(_) => true,
         }
+    }
+
+    fn admits_explicit_file(
+        &self,
+        path: &Path,
+        root: &Path,
+        relative: &Path,
+        config: &IndexConfig,
+        exclude_set: &globset::GlobSet,
+    ) -> bool {
+        let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+        // Exact includes still have to be source files. The server's parser
+        // registry is the authoritative extension list; the shared filter
+        // keeps this list to text source formats supported by it.
+        if !ext.is_empty() && !config
+            .explicit_source_extensions
+            .iter()
+            .any(|known| known == ext)
+        {
+            return false;
+        }
+        let mut bypasses_pruned_directory = false;
+        let components: Vec<_> = relative.components().collect();
+        if components.len().saturating_sub(1) > config.max_depth as usize {
+            return false;
+        }
+        let mut current = root.to_path_buf();
+        for (index, component) in components.iter().enumerate() {
+            current.push(component);
+            let name = component.as_os_str().to_string_lossy();
+            let is_dir = index + 1 < components.len();
+            if name.starts_with('.') || exclude_set.is_match(&current) {
+                return false;
+            }
+            if is_dir
+                && config
+                    .exclude_dirs
+                    .iter()
+                    .any(|excluded| excluded == name.as_ref())
+            {
+                if name == "fixtures" && ext == "json" {
+                    // Only this exact JSON file is admitted; siblings stay pruned.
+                    continue;
+                } else if name == "examples" || name == "dist" || (name == "bin" && ext.is_empty()) {
+                    bypasses_pruned_directory = true;
+                } else {
+                    return false;
+                }
+            }
+        }
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return false;
+        }
+        if ext.is_empty() && path.exists() && crate::parser_registry::extensionless_source_kind(path).is_none() {
+            return false;
+        }
+        // The caller-owned exception covers hand-maintained shell launch
+        // scripts and CMake source/configuration under default-pruned example
+        // and dist trees. Compiled web assets and other generated outputs stay
+        // out even when a caller accidentally lists them.
+        if bypasses_pruned_directory && !matches!(ext, "sh" | "cmake" | "") {
+            return false;
+        }
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let Some(canonical_file) = canonical_candidate(path) else {
+            // For a watched deletion, the file itself is gone; resolving its
+            // existing parent still proves the exact in-root path identity.
+            let Some(canonical_missing_file) = canonical_candidate(path) else {
+                return false;
+            };
+            if !canonical_missing_file.starts_with(&canonical_root) {
+                return false;
+            }
+            return true;
+        };
+        if !canonical_file.starts_with(&canonical_root) {
+            return false;
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return false,
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return false,
+            _ => {}
+        }
+        match std::fs::metadata(path) {
+            Ok(metadata) => metadata.is_file() && (metadata.len() <= config.max_file_size_bytes
+                || (ext == "json" && metadata.len() <= 4 * 1024 * 1024)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        }
+    }
+
+    /// Whether a directory is part of the walk for one of the configured
+    /// workspace roots. The root itself is admitted just as
+    /// `index_workspace()` admits its root before `index_directory()` checks
+    /// descendants; every child component uses the exact shared exclusion
+    /// predicate and depth accounting used by that walk.
+    pub(crate) fn admits_directory(&self, path: &Path) -> bool {
+        let Some((root, relative, config, exclude_set)) = self.locate(path) else {
+            return false;
+        };
+        let components: Vec<_> = relative.components().collect();
+        if components.len() > config.max_depth as usize {
+            return false;
+        }
+
+        let mut current = root;
+        for component in components {
+            current.push(component);
+            if is_excluded_entry(config, exclude_set, &current, true) {
+                return false;
+            }
+        }
+        true
     }
 
     /// `path` spelled the way the indexer stored it.
@@ -183,6 +458,12 @@ pub struct IndexConfig {
     pub max_depth: u32,
     /// Maximum number of files to index in a single run.
     pub max_files: usize,
+    /// Exact source paths supplied by the workspace owner. These paths may
+    /// bypass only `examples`/`dist` directory pruning; file-pattern,
+    /// credential, root-containment and symlink checks still apply.
+    pub explicit_source_files: Vec<PathBuf>,
+    /// Extensions supported by the caller's parser registry, without dots.
+    pub explicit_source_extensions: Vec<String>,
 }
 
 impl Default for IndexConfig {
@@ -193,6 +474,8 @@ impl Default for IndexConfig {
             max_file_size_bytes: 1024 * 1024, // 1 MiB
             max_depth: 20,
             max_files: 5_000,
+            explicit_source_files: Vec::new(),
+            explicit_source_extensions: Vec::new(),
         }
     }
 }
@@ -456,6 +739,8 @@ impl IndexConfig {
             globset::GlobSet::empty()
         })
     }
+
+
 }
 
 /// Result of an indexing run.
@@ -528,6 +813,12 @@ impl Indexer {
             // workspace can have its own rules; doesn't pollute other
             // folders' configs.
             let mut folder_config = config.clone();
+            // Reserve capacity for the owner's exact inclusions so a large
+            // ordinary walk cannot consume the entire limit before they are
+            // reached. The total still stays within `max_files`.
+            folder_config.max_files = config
+                .max_files
+                .saturating_sub(config.explicit_source_files.len().min(config.max_files));
             folder_config.extend_from_codegraphignore(folder);
             let (total, parsed, skipped, by_lang, parser_errors) = self
                 .index_directory(graph, folder, &folder_config, 0, counter.clone())
@@ -540,6 +831,40 @@ impl Indexer {
             }
             for (lang, count) in parser_errors {
                 *result.parser_errors_by_language.entry(lang).or_insert(0) += count;
+            }
+        }
+
+        // The owner may name exact source files under normally-pruned example
+        // or distribution directories. Index only those paths, after applying
+        // the same root, secret-pattern, size and symlink checks used by the
+        // watcher. No excluded directory is traversed.
+        if !config.explicit_source_files.is_empty() {
+            let filter = WorkspaceFilter::new(folders, config);
+            for source in &config.explicit_source_files {
+                let Some(source) = canonical_candidate(source) else {
+                    tracing::warn!("Ignoring explicit source path with unresolved parent");
+                    continue;
+                };
+                if !filter.admits(&source) {
+                    tracing::warn!("Ignoring explicit source path that failed workspace filters");
+                    continue;
+                }
+                if counter.load(std::sync::atomic::Ordering::Relaxed) >= config.max_files {
+                    tracing::warn!("Reached max indexed file limit of {}", config.max_files);
+                    break;
+                }
+                match self.index_file(graph, &source).await {
+                    Ok(parsed) => {
+                        result.total_files += 1;
+                        if parsed {
+                            result.files_parsed += 1;
+                        } else {
+                            result.files_skipped += 1;
+                        }
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(error) => tracing::warn!("Failed to index explicit source file: {error}"),
+                }
             }
         }
 
@@ -565,13 +890,74 @@ impl Indexer {
             }
         }
 
-        // Persist index state
-        {
-            let state = self.index_state.lock().await;
-            state.save();
-        }
-
         result
+    }
+
+    /// Persist file hashes only after the caller has successfully persisted
+    /// the graph they describe.
+    pub async fn save_index_state(&self) -> bool {
+        let mut state = self.index_state.lock().await;
+        if state.save() {
+            true
+        } else {
+            state.invalidate_saved_state();
+            false
+        }
+    }
+
+    /// Invalidate hashes after graph persistence fails. A future run must
+    /// rebuild rather than skip files based on state that may no longer match
+    /// the persisted graph.
+    pub async fn invalidate_index_state(&self) -> bool {
+        self.index_state.lock().await.invalidate_saved_state()
+    }
+
+    /// Commit or invalidate file hashes according to the graph persistence
+    /// result. This is the single gate for callers that finish a workspace
+    /// parse: durable hashes are written only after the graph write succeeds.
+    pub async fn finalize_graph_persist(&self, graph_persisted: bool) -> bool {
+        if graph_persisted {
+            self.save_index_state().await
+        } else {
+            self.invalidate_index_state().await;
+            false
+        }
+    }
+
+    /// Persist a stable graph snapshot before committing the hashes that
+    /// describe it. Every incremental writer (MCP tools and filesystem
+    /// watcher included) must pass through this gate so a failed graph write
+    /// invalidates the checkpoint instead of acknowledging mismatched state.
+    pub async fn persist_graph_snapshot<F>(
+        &self,
+        graph: &Arc<RwLock<CodeGraph>>,
+        persist: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(&CodeGraph) -> Result<(), String>,
+    {
+        let persist_result = {
+            let graph = graph.read().await;
+            persist(&graph)
+        };
+        let graph_persisted = persist_result.is_ok();
+        let state_saved = self.finalize_graph_persist(graph_persisted).await;
+        match persist_result {
+            Err(error) => Err(error),
+            Ok(()) if !state_saved => {
+                Err("graph persisted, but index state could not be committed".to_string())
+            }
+            Ok(()) => Ok(()),
+        }
+    }
+
+    /// Remove a deleted path from the in-memory index checkpoint. The next
+    /// successful graph snapshot commits this change with the graph itself.
+    pub async fn remove_file_hash(&self, path: &Path) -> bool {
+        let mut state = self.index_state.lock().await;
+        let existed = state.get_hash(path).is_some();
+        state.remove(path);
+        existed
     }
 
     /// Recursively walk a directory and index supported files.
@@ -668,7 +1054,7 @@ impl Indexer {
                 } else if path.is_file() {
                     // Skip files that exceed the configurable size limit
                     if let Ok(metadata) = std::fs::metadata(&path) {
-                        if metadata.len() > config.max_file_size_bytes {
+                        if metadata.len() > config.max_file_size_bytes && !is_sql_path(&path) {
                             tracing::info!(
                                 "Skipping {:?}: file size {} exceeds limit of {}",
                                 path,
@@ -685,9 +1071,14 @@ impl Indexer {
                         let ext_with_dot = format!(".{}", ext_str);
                         let is_supported = supported_extensions
                             .iter()
-                            .any(|e| *e == ext_str.as_ref() || *e == ext_with_dot);
+                            .any(|e| *e == ext_str.as_ref() || *e == ext_with_dot)
+                            || path
+                                .file_name()
+                                .is_some_and(|name| name == "CMakeLists.txt");
 
-                        if is_supported {
+                        let config_is_explicit = !matches!(ext_str.as_ref(), "conf" | "dist")
+                            || config.explicit_source_files.iter().any(|p| canonical_candidate(p) == canonical_candidate(&path));
+                        if is_supported && config_is_explicit && self.parsers.can_parse(&path) {
                             // Resolve the parser before parsing so we can
                             // attribute the file (and any error) to a
                             // specific language for telemetry.
@@ -729,8 +1120,9 @@ impl Indexer {
         graph: &Arc<RwLock<CodeGraph>>,
         path: &Path,
     ) -> Result<bool, String> {
-        // Read content and compute hash
-        let content = std::fs::read(path).map_err(|e| format!("Read error: {e}"))?;
+        // Read content and compute hash. SQL has a parser-specific larger
+        // bound, enforced before allocating the full contents.
+        let content = read_index_content(path)?;
         let hash = Self::hash_content(&content);
 
         // Check if file content has changed since last index
@@ -747,10 +1139,8 @@ impl Indexer {
         {
             let mut g = graph.write().await;
             let path_str = path.to_string_lossy().to_string();
-            if let Ok(old_nodes) = g.query().property("path", path_str).execute() {
-                for old_id in old_nodes {
-                    let _ = g.delete_node(old_id);
-                }
+            for old_id in g.nodes_by_path(&path_str) {
+                let _ = g.delete_node(old_id);
             }
 
             match self.parsers.parse_file(path, &mut g) {
@@ -770,6 +1160,115 @@ impl Indexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codegraph::{NamespacedBackend, NodeType, PropertyMap, RocksDBBackend};
+
+    #[tokio::test]
+    async fn hashes_commit_after_graph_success_and_stale_state_is_invalidated_on_failure() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(IndexState::for_workspace(
+            "indexer-state-test",
+            workspace.path(),
+        )));
+        let indexer = Indexer::new(Arc::new(ParserRegistry::new()), Arc::clone(&state));
+        let source = workspace.path().join("source.rs");
+
+        {
+            let mut hashes = state.lock().await;
+            hashes.set_hash(source.clone(), 11);
+            assert!(hashes.save());
+            hashes.set_hash(source.clone(), 22);
+        }
+        assert!(!indexer.finalize_graph_persist(false).await);
+        {
+            let mut loaded = IndexState::for_workspace("indexer-state-test", workspace.path());
+            assert_eq!(loaded.load(), 0);
+            assert!(loaded.get_hash(&source).is_none());
+        }
+
+        state.lock().await.set_hash(source.clone(), 33);
+        assert!(indexer.finalize_graph_persist(true).await);
+        let mut loaded = IndexState::for_workspace("indexer-state-test", workspace.path());
+        assert_eq!(loaded.load(), 1);
+        assert_eq!(loaded.get_hash(&source), Some(33));
+    }
+
+    #[tokio::test]
+    async fn shared_persistence_gate_commits_graph_and_hashes_for_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("codegraph-harness-gate-restart");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let db = workspace.join("graph.db");
+        let state = Arc::new(Mutex::new(IndexState::for_workspace(
+            "gate-restart-test",
+            &workspace,
+        )));
+        let indexer = Indexer::new(Arc::new(ParserRegistry::new()), Arc::clone(&state));
+        let source = workspace.join("source.rs");
+        state.lock().await.set_hash(source.clone(), 1234);
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        graph
+            .write()
+            .await
+            .add_node(NodeType::Function, PropertyMap::new())
+            .unwrap();
+
+        indexer
+            .persist_graph_snapshot(&graph, |graph| {
+                let backend = RocksDBBackend::open(&db).map_err(|error| error.to_string())?;
+                graph
+                    .persist_to(Box::new(NamespacedBackend::new(
+                        Box::new(backend),
+                        "gate-restart-test",
+                    )))
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap();
+
+        // Simulate process restart: both the graph namespace and its matching
+        // file hashes must be independently reloadable after the gate returns.
+        let backend = RocksDBBackend::open(&db).unwrap();
+        let mut restored = CodeGraph::with_backend(Box::new(NamespacedBackend::new(
+            Box::new(backend),
+            "gate-restart-test",
+        )))
+        .unwrap();
+        assert_eq!(restored.node_count(), 1);
+        restored.detach_storage().unwrap();
+        let mut restored_state = IndexState::for_workspace("gate-restart-test", &workspace);
+        assert_eq!(restored_state.load(), 1);
+        assert_eq!(restored_state.get_hash(&source), Some(1234));
+    }
+
+    #[tokio::test]
+    async fn failed_shared_persistence_gate_invalidates_hash_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("codegraph-harness-gate-failure");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("source.rs");
+        let state = Arc::new(Mutex::new(IndexState::for_workspace(
+            "gate-failure-test",
+            &workspace,
+        )));
+        {
+            let mut state = state.lock().await;
+            state.set_hash(source.clone(), 5678);
+            assert!(state.save());
+        }
+        let indexer = Indexer::new(Arc::new(ParserRegistry::new()), Arc::clone(&state));
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+
+        let result = indexer
+            .persist_graph_snapshot(&graph, |_| Err("simulated database lock".to_string()))
+            .await;
+        assert_eq!(result.unwrap_err(), "simulated database lock");
+
+        let mut restored_state = IndexState::for_workspace("gate-failure-test", &workspace);
+        assert_eq!(restored_state.load(), 0);
+        assert!(workspace
+            .join(".codegraph-state/index_state.invalid")
+            .exists());
+    }
 
     #[test]
     fn default_exclude_patterns_includes_binary_archives() {
@@ -797,6 +1296,8 @@ mod tests {
             max_file_size_bytes: 1024 * 1024,
             max_depth,
             max_files: 1000,
+            explicit_source_files: vec![],
+            explicit_source_extensions: vec![],
         }
     }
 
@@ -821,6 +1322,143 @@ mod tests {
     }
 
     #[test]
+    fn exact_source_includes_bypass_only_example_dist_and_never_follow_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let examples = root.join("apps/examples");
+        let dist = root.join("conf/dist");
+        let dist_cmake = root.join("conf/dist/config.cmake");
+        let generated = root.join("module/dist/assets");
+        let private = root.join("private");
+        std::fs::create_dir_all(&examples).unwrap();
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::create_dir_all(&generated).unwrap();
+        std::fs::create_dir_all(&private).unwrap();
+        let example_shell = examples.join("restarter.sh");
+        let dist_shell = dist.join("config.sh");
+        let sibling = examples.join("unlisted.sh");
+        let generated_js = generated.join("bundle.js");
+        let private_shell = private.join("credentials.sh");
+        let secret_file = root.join(".env");
+        for path in [
+            &example_shell,
+            &dist_shell,
+            &sibling,
+            &generated_js,
+            &private_shell,
+            &secret_file,
+        ] {
+            std::fs::write(path, "#!/bin/sh\n").unwrap();
+        }
+        std::fs::write(&dist_cmake, "include(sample)\n").unwrap();
+        let outside = tmp.path().join("outside.sh");
+        std::fs::write(&outside, "#!/bin/sh\n").unwrap();
+        let symlink = examples.join("outside.sh");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &symlink).unwrap();
+
+        let mut config = IndexConfig::default();
+        config.exclude_dirs.push("private".into());
+        config.explicit_source_files = vec![
+            example_shell.clone(),
+            dist_shell.clone(),
+            dist_cmake.clone(),
+            generated_js.clone(),
+            private_shell.clone(),
+            secret_file.clone(),
+        ];
+        #[cfg(unix)]
+        config.explicit_source_files.push(symlink.clone());
+        config.explicit_source_extensions =
+            vec!["sh".into(), "cmake".into(), "js".into(), "env".into()];
+        let filter = WorkspaceFilter::new(std::slice::from_ref(&root), &config);
+
+        assert!(filter.admits(&example_shell));
+        assert!(filter.admits(&dist_shell));
+        assert!(filter.admits(&dist_cmake));
+        assert!(!filter.admits(&sibling));
+        assert!(!filter.admits(&generated_js));
+        assert!(!filter.admits(&private_shell));
+        assert!(!filter.admits(&secret_file));
+        #[cfg(unix)]
+        assert!(!filter.admits(&symlink));
+    }
+
+    #[test]
+    fn exact_extensionless_sources_allow_scripts_but_not_binaries_or_private_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("private")).unwrap();
+        let script = root.join("bin/acore");
+        let binary = root.join("bin/program");
+        let sibling = root.join("bin/unlisted");
+        let private = root.join("private/tool");
+        let docker = root.join("Dockerfile");
+        for p in [&script, &sibling, &private] { std::fs::write(p, "#!/usr/bin/env bash\necho ok\n").unwrap(); }
+        std::fs::write(&binary, b"\x7fELFbinary").unwrap();
+        std::fs::write(&docker, "FROM example\n").unwrap();
+        let mut config = IndexConfig::default();
+        config.exclude_dirs.push("private".into());
+        config.explicit_source_files = vec![script.clone(), binary.clone(), private.clone(), docker.clone()];
+        let filter = WorkspaceFilter::new(std::slice::from_ref(&root), &config);
+        assert!(filter.admits(&script)); assert!(filter.admits(&docker));
+        assert!(!filter.admits(&binary)); assert!(!filter.admits(&private)); assert!(!filter.admits(&sibling));
+        assert_eq!(crate::parser_registry::extensionless_source_kind(&script), Some("bash"));
+        std::fs::remove_file(&script).unwrap();
+        assert!(filter.admits(&script));
+        assert!(filter.is_explicit_file(&script));
+    }
+
+    #[test]
+    fn exact_json_fixture_does_not_open_the_fixture_directory() {
+        let tmp = tempfile::tempdir().unwrap(); let root = tmp.path().join("project");
+        let dir = root.join("t/fixtures/nav"); std::fs::create_dir_all(&dir).unwrap();
+        let selected = dir.join("selected.json"); let sibling = dir.join("sibling.json");
+        std::fs::write(&selected, "{\"name\":\"selected\"}").unwrap(); std::fs::write(&sibling, "{\"name\":\"sibling\"}").unwrap();
+        let mut config = IndexConfig::default(); config.explicit_source_files = vec![selected.clone()]; config.explicit_source_extensions = vec!["json".into()];
+        let filter = WorkspaceFilter::new(std::slice::from_ref(&root), &config);
+        assert!(filter.admits(&selected)); assert!(!filter.admits(&sibling));
+    }
+
+    #[test]
+    fn larger_json_requires_exact_inclusion_and_remains_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let selected = root.join("selected.json");
+        let sibling = root.join("sibling.json");
+        for path in [&selected, &sibling] {
+            std::fs::File::create(path).unwrap().set_len(2 * 1024 * 1024).unwrap();
+        }
+        let mut config = IndexConfig::default();
+        config.explicit_source_files = vec![selected.clone()];
+        config.explicit_source_extensions = vec!["json".into()];
+        let filter = WorkspaceFilter::new(&[root.to_path_buf()], &config);
+        assert!(filter.admits(&selected));
+        assert!(!filter.admits(&sibling));
+        std::fs::OpenOptions::new().write(true).open(&selected).unwrap().set_len(4 * 1024 * 1024 + 1).unwrap();
+        assert!(!filter.admits(&selected));
+    }
+
+    #[tokio::test]
+    async fn config_templates_are_not_walked_without_exact_inclusion() {
+        let tmp = tempfile::tempdir().unwrap(); let root = tmp.path().to_path_buf();
+        let allowed = root.join("selected.conf.dist"); let other = root.join("other.conf");
+        std::fs::write(&allowed, "Selected.Option = fake-value\n").unwrap();
+        std::fs::write(&other, "Unlisted.Option = fake-value\n").unwrap();
+        let parsers = Arc::new(ParserRegistry::new());
+        let state = Arc::new(Mutex::new(IndexState::for_workspace("config-scope-test", &root)));
+        let indexer = Indexer::new(parsers.clone(), state);
+        let mut config = IndexConfig::default(); config.explicit_source_files = vec![allowed];
+        config.explicit_source_extensions = parsers.supported_extensions().iter().map(|s| s.trim_start_matches('.').to_string()).collect();
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        indexer.index_workspace(&graph, std::slice::from_ref(&root), &config).await;
+        let g = graph.read().await;
+        assert!(g.iter_nodes().any(|(_, n)| n.properties.get_string("name") == Some("Selected.Option")));
+        assert!(!g.iter_nodes().any(|(_, n)| n.properties.get_string("name") == Some("Unlisted.Option")));
+    }
+
+    #[test]
     fn workspace_filter_reads_codegraphignore_per_root() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
@@ -839,6 +1477,40 @@ mod tests {
 
         assert!(filter.admits(&root.join("a/file.rs")));
         assert!(!filter.admits(&root.join("a/b/file.rs")));
+    }
+
+    #[test]
+    fn workspace_filter_keeps_sql_for_its_bounded_parser_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let sql = root.join("large.sql");
+        let source = root.join("large.rs");
+        std::fs::File::create(&sql)
+            .unwrap()
+            .set_len(2 * 1024 * 1024)
+            .unwrap();
+        std::fs::File::create(&source)
+            .unwrap()
+            .set_len(2 * 1024 * 1024)
+            .unwrap();
+        let filter = WorkspaceFilter::new(std::slice::from_ref(&root), &filter_config(&[], 20));
+
+        assert!(filter.admits(&sql));
+        assert!(!filter.admits(&source));
+    }
+
+    #[test]
+    fn index_content_rejects_oversized_sql_before_reading_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sql = tmp.path().join("oversized.sql");
+        std::fs::File::create(&sql)
+            .unwrap()
+            .set_len(MAX_SQL_FILE_SIZE_BYTES + 1)
+            .unwrap();
+
+        let error = read_index_content(&sql).unwrap_err();
+        assert!(error.contains("SQL file exceeds"), "{error}");
+        assert!(error.contains(&MAX_SQL_FILE_SIZE_BYTES.to_string()));
     }
 
     /// A workspace reached through a symlink is reported by the OS at its
@@ -920,6 +1592,8 @@ mod tests {
             max_file_size_bytes: 1024,
             max_depth: 5,
             max_files: 100,
+            explicit_source_files: vec![],
+            explicit_source_extensions: vec![],
         };
         config.extend_from_codegraphignore(tmp.path());
         // Pre-existing patterns are kept.

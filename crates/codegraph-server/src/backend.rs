@@ -532,7 +532,7 @@ impl CodeGraphBackend {
                 .map_err(|e| format!("Failed to create ~/.codegraph: {e}"))?;
         }
 
-        let mut rocks = crate::memory::open_shared_graph_db(&db_path)
+        let mut rocks = crate::memory::open_shared_graph_db_for_persist(&db_path)
             .map_err(|e| format!("Failed to open graph.db: {e}"))?;
 
         let registry_value = serde_json::json!({
@@ -1226,7 +1226,7 @@ impl LanguageServer for CodeGraphBackend {
         // in the graph. Without a persisted graph they would make the indexer
         // skip every unchanged file and leave the session empty.
         if !loaded_from_persistence {
-            self.index_state.lock().await.clear();
+            self.index_state.lock().await.invalidate_saved_state();
         }
 
         // Run incremental indexing: hash-based dedup skips unchanged files.
@@ -1322,10 +1322,22 @@ impl LanguageServer for CodeGraphBackend {
                 if let Some(first) = folders.first() {
                     let slug = crate::memory::project_slug(first);
                     let graph = self.graph.read().await;
-                    if let Err(e) = Self::persist_graph_to_rocksdb(&slug, first, &graph) {
-                        tracing::warn!("Failed to persist graph: {}", e);
-                    } else {
-                        tracing::info!("Graph persisted to RocksDB for next session");
+                    let persist_result = Self::persist_graph_to_rocksdb(&slug, first, &graph);
+                    drop(graph);
+                    let state_saved = self
+                        .indexer
+                        .finalize_graph_persist(persist_result.is_ok())
+                        .await;
+                    match persist_result {
+                        Err(e) => tracing::warn!("Failed to persist graph: {}", e),
+                        Ok(()) => {
+                            tracing::info!("Graph persisted to RocksDB for next session");
+                            if !state_saved {
+                                tracing::error!(
+                                    "Graph persisted, but index state could not be committed"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -2056,8 +2068,18 @@ impl LanguageServer for CodeGraphBackend {
                     if let Some(first) = folders.first() {
                         let slug = crate::memory::project_slug(first);
                         let graph = self.graph.read().await;
-                        if let Err(e) = Self::persist_graph_to_rocksdb(&slug, first, &graph) {
-                            tracing::warn!("Failed to persist graph after reindex: {}", e);
+                        let persist_result = Self::persist_graph_to_rocksdb(&slug, first, &graph);
+                        drop(graph);
+                        let state_saved = self
+                            .indexer
+                            .finalize_graph_persist(persist_result.is_ok())
+                            .await;
+                        match persist_result {
+                            Err(e) => tracing::warn!("Failed to persist graph after reindex: {}", e),
+                            Ok(()) if !state_saved => tracing::error!(
+                                "Graph persisted after reindex, but index state could not be committed"
+                            ),
+                            Ok(()) => {}
                         }
                         if let Err(e) = self.query_engine.save_symbol_vectors(&slug).await {
                             tracing::warn!("Failed to persist symbol vectors: {}", e);

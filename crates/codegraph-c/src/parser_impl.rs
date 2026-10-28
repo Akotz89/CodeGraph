@@ -5,7 +5,8 @@
 
 use codegraph::CodeGraph;
 use codegraph_parser_api::{
-    CodeIR, CodeParser, FileInfo, ParserConfig, ParserError, ParserMetrics, ProjectInfo,
+    decode_source_bytes, CodeIR, CodeParser, FileInfo, ParserConfig, ParserError, ParserMetrics,
+    ProjectInfo,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -200,9 +201,15 @@ impl CodeParser for CParser {
             ));
         }
 
+        let bytes = fs::read(path).map_err(|e| ParserError::IoError(path.to_path_buf(), e))?;
         let source =
-            fs::read_to_string(path).map_err(|e| ParserError::IoError(path.to_path_buf(), e))?;
-        let result = self.parse_source(&source, path, graph);
+            decode_source_bytes(&bytes).map_err(|e| ParserError::IoError(path.to_path_buf(), e))?;
+        let result = self.parse_source(&source, path, graph).map(|mut info| {
+            // Report the physical file size, not the larger UTF-8 byte count
+            // after the supported Latin-1 in-memory conversion.
+            info.byte_count = bytes.len();
+            info
+        });
 
         let duration = start.elapsed();
         if let Ok(ref info) = result {

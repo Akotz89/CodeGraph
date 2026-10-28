@@ -160,7 +160,7 @@ pub fn get_all_tools() -> Vec<Tool> {
 // Helper to create property schema
 fn string_prop(description: &str) -> PropertySchema {
     PropertySchema {
-        property_type: "string".to_string(),
+        property_type: "string".into(),
         description: Some(description.to_string()),
         default: None,
         enum_values: None,
@@ -170,9 +170,15 @@ fn string_prop(description: &str) -> PropertySchema {
     }
 }
 
+fn node_id_prop(description: &str) -> PropertySchema {
+    let mut property = string_prop(description);
+    property.property_type = serde_json::json!(["integer", "string"]);
+    property
+}
+
 fn number_prop(description: &str, default: Option<f64>) -> PropertySchema {
     PropertySchema {
-        property_type: "number".to_string(),
+        property_type: "number".into(),
         description: Some(description.to_string()),
         default: default.map(|v| serde_json::json!(v)),
         enum_values: None,
@@ -184,7 +190,7 @@ fn number_prop(description: &str, default: Option<f64>) -> PropertySchema {
 
 fn boolean_prop(description: &str, default: bool) -> PropertySchema {
     PropertySchema {
-        property_type: "boolean".to_string(),
+        property_type: "boolean".into(),
         description: Some(description.to_string()),
         default: Some(serde_json::json!(default)),
         enum_values: None,
@@ -196,7 +202,7 @@ fn boolean_prop(description: &str, default: bool) -> PropertySchema {
 
 fn enum_prop(description: &str, values: Vec<&str>, default: Option<&str>) -> PropertySchema {
     PropertySchema {
-        property_type: "string".to_string(),
+        property_type: "string".into(),
         description: Some(description.to_string()),
         default: default.map(|v| serde_json::json!(v)),
         enum_values: Some(values.into_iter().map(|s| s.to_string()).collect()),
@@ -208,12 +214,12 @@ fn enum_prop(description: &str, values: Vec<&str>, default: Option<&str>) -> Pro
 
 fn array_prop(description: &str, item_type: &str) -> PropertySchema {
     PropertySchema {
-        property_type: "array".to_string(),
+        property_type: "array".into(),
         description: Some(description.to_string()),
         default: None,
         enum_values: None,
         items: Some(Box::new(PropertySchema {
-            property_type: item_type.to_string(),
+            property_type: item_type.into(),
             description: None,
             default: None,
             enum_values: None,
@@ -480,6 +486,10 @@ fn find_related_tests_tool() -> Tool {
 fn get_symbol_info_tool() -> Tool {
     let mut properties = HashMap::new();
     properties.insert(
+        "nodeId".to_string(),
+        node_id_prop("Internal node ID from symbol_search. Alternative to uri+line."),
+    );
+    properties.insert(
         "uri".to_string(),
         string_prop(
             "The file URI containing the symbol (e.g. file:///Users/me/project/src/main.rs)",
@@ -499,11 +509,11 @@ fn get_symbol_info_tool() -> Tool {
 
     Tool {
         name: "codegraph_get_symbol_info".to_string(),
-        description: Some("Gets quick metadata about any symbol (function, class, variable, type). USE WHEN: you need to quickly understand what a symbol is, check its signature, or see usage count. FASTER than codegraph_get_ai_context when you only need basic info. Returns: name, kind, signature, visibility, file path, line range, and properties (is_async, is_static, etc.). Set includeReferences=true to also get all reference locations (slower). Requires uri and line parameters.".to_string()),
+        description: Some("Gets quick metadata about any symbol (function, class, variable, type). USE WHEN: you need to quickly understand what a symbol is, check its signature, or see usage count. FASTER than codegraph_get_ai_context when you only need basic info. Returns: name, kind, signature, visibility, file path, line range, and properties (is_async, is_static, etc.). Set includeReferences=true to also get all reference locations (slower). Identify the symbol by uri and line or nodeId from symbol_search.".to_string()),
         input_schema: ToolInputSchema {
             schema_type: "object".to_string(),
             properties: Some(properties),
-            required: Some(vec!["uri".to_string(), "line".to_string()]),
+            required: None,
         },
     }
 }
@@ -713,7 +723,7 @@ fn traverse_graph_tool() -> Tool {
     );
     properties.insert(
         "startNodeId".to_string(),
-        string_prop("Internal node ID from symbol_search. Alternative to uri+line."),
+        node_id_prop("Internal node ID from symbol_search. Alternative to uri+line."),
     );
     properties.insert(
         "direction".to_string(),
@@ -820,7 +830,7 @@ fn get_callers_tool() -> Tool {
     );
     properties.insert(
         "nodeId".to_string(),
-        string_prop("Internal node ID from symbol_search. Alternative to uri+line."),
+        node_id_prop("Internal node ID from symbol_search. Alternative to uri+line."),
     );
     properties.insert(
         "depth".to_string(),
@@ -853,7 +863,7 @@ fn get_callees_tool() -> Tool {
     );
     properties.insert(
         "nodeId".to_string(),
-        string_prop("Internal node ID from symbol_search. Alternative to uri+line."),
+        node_id_prop("Internal node ID from symbol_search. Alternative to uri+line."),
     );
     properties.insert(
         "depth".to_string(),
@@ -886,7 +896,7 @@ fn get_detailed_symbol_tool() -> Tool {
     );
     properties.insert(
         "nodeId".to_string(),
-        string_prop("Internal node ID from symbol_search. Alternative to uri+line."),
+        node_id_prop("Internal node ID from symbol_search. Alternative to uri+line."),
     );
     properties.insert(
         "includeSource".to_string(),
@@ -1169,12 +1179,12 @@ fn index_files_tool() -> Tool {
     properties.insert(
         "paths".to_string(),
         PropertySchema {
-            property_type: "array".to_string(),
+            property_type: "array".into(),
             description: Some("Array of absolute file paths to add to the index".to_string()),
             default: None,
             enum_values: None,
             items: Some(Box::new(PropertySchema {
-                property_type: "string".to_string(),
+                property_type: "string".into(),
                 description: Some("Absolute file path".to_string()),
                 default: None,
                 enum_values: None,
@@ -1724,6 +1734,23 @@ fn search_by_error_tool() -> Tool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_id_schemas_accept_strings_and_integers() {
+        let tools = get_all_tools();
+        for (name, field) in [
+            ("codegraph_get_symbol_info", "nodeId"),
+            ("codegraph_get_callers", "nodeId"),
+            ("codegraph_get_callees", "nodeId"),
+            ("codegraph_get_detailed_symbol", "nodeId"),
+            ("codegraph_traverse_graph", "startNodeId"),
+        ] {
+            let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+            let schema = serde_json::to_value(&tool.input_schema).unwrap();
+            assert_eq!(schema["properties"][field]["type"], serde_json::json!(["integer", "string"]));
+            assert!(!schema["required"].as_array().is_some_and(|required| required.contains(&serde_json::json!("uri"))));
+        }
+    }
 
     #[test]
     fn test_get_all_tools_count() {
