@@ -116,10 +116,16 @@ pub struct McpBackend {
     pub exclude_dirs: Vec<String>,
     /// Maximum number of files to index
     pub max_files: usize,
+    /// Caller-selected exact source files that remain indexed and watched
+    /// even when their parent is an excluded example/distribution directory.
+    pub explicit_source_files: Vec<PathBuf>,
     /// Shared indexer for directory walking and file parsing
     pub indexer: Arc<Indexer>,
     /// Index state for hash persistence (shared with indexer)
     index_state: Arc<Mutex<IndexState>>,
+    /// Whether the most recent workspace index snapshot reached shared graph
+    /// storage. Read by forced reindex tools to avoid reporting false success.
+    last_graph_persist_succeeded: Arc<std::sync::atomic::AtomicBool>,
     /// Skip embedding generation — graph + structural tools only.
     /// For CI / one-shot runs where semantic search isn't needed.
     /// Avoids loading the ~100MB ONNX model entirely.
@@ -159,15 +165,52 @@ impl Default for RecoveryStats {
 impl McpBackend {
     /// Create a new MCP backend for the given workspace.
     ///
-    /// Starts with a fresh in-memory graph (re-indexes all files on startup).
-    /// After indexing, persists to the shared database at `~/.codegraph/graph.db`
-    /// (namespaced by project slug) for cross-project access.
+    /// Loads this project's graph from the shared database when available.
+    /// After indexing, persists to `~/.codegraph/graph.db` under its namespace.
     pub fn new(
         workspaces: Vec<PathBuf>,
         exclude_dirs: Vec<String>,
         max_files: usize,
         embedding_model: codegraph_memory::EmbeddingBackend,
         full_body_embedding: bool,
+    ) -> Self {
+        Self::new_with_graph_load(
+            workspaces,
+            exclude_dirs,
+            max_files,
+            embedding_model,
+            full_body_embedding,
+            true,
+        )
+    }
+
+    /// Create a backend with an empty graph without opening the shared DB.
+    /// Intended for a one-shot forced rebuild that will replace this project's
+    /// graph and must not load stale or combined namespace data first.
+    pub fn new_fresh(
+        workspaces: Vec<PathBuf>,
+        exclude_dirs: Vec<String>,
+        max_files: usize,
+        embedding_model: codegraph_memory::EmbeddingBackend,
+        full_body_embedding: bool,
+    ) -> Self {
+        Self::new_with_graph_load(
+            workspaces,
+            exclude_dirs,
+            max_files,
+            embedding_model,
+            full_body_embedding,
+            false,
+        )
+    }
+
+    fn new_with_graph_load(
+        workspaces: Vec<PathBuf>,
+        exclude_dirs: Vec<String>,
+        max_files: usize,
+        embedding_model: codegraph_memory::EmbeddingBackend,
+        full_body_embedding: bool,
+        load_persisted_graph: bool,
     ) -> Self {
         let primary = workspaces.first().expect("At least one workspace required");
         let slug = memory::project_slug(primary);
@@ -184,30 +227,37 @@ impl McpBackend {
         // a single fallback (the prior `_ =>` arm) hid stale-LOCK failures
         // as "no prior data" and silently downgraded the session to
         // memory-only mode (see issue #3 follow-up).
-        let graph = match Self::open_persistent_graph(&slug) {
-            Ok(g) if g.node_count() > 0 => {
-                tracing::info!(
-                    "Loaded persisted graph ({} nodes) from previous session",
-                    g.node_count()
-                );
-                Arc::new(RwLock::new(g))
-            }
-            Ok(_) => {
-                tracing::info!("No persisted graph found — starting fresh");
-                Arc::new(RwLock::new(
-                    CodeGraph::in_memory().expect("Failed to create in-memory graph"),
-                ))
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Could not load the persisted graph ({e}) - this session re-indexes the \
+        let graph = if load_persisted_graph {
+            match Self::open_persistent_graph(&slug) {
+                Ok(g) if g.node_count() > 0 => {
+                    tracing::info!(
+                        "Loaded persisted graph ({} nodes) from previous session",
+                        g.node_count()
+                    );
+                    Arc::new(RwLock::new(g))
+                }
+                Ok(_) => {
+                    tracing::info!("No persisted graph found — starting fresh");
+                    Arc::new(RwLock::new(
+                        CodeGraph::in_memory().expect("Failed to create in-memory graph"),
+                    ))
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Could not load the persisted graph ({e}) - this session re-indexes the \
                      workspace instead. If another codegraph process keeps ~/.codegraph/graph.db \
                      busy, restart this session once it is idle."
-                );
-                Arc::new(RwLock::new(
-                    CodeGraph::in_memory().expect("Failed to create in-memory graph"),
-                ))
+                    );
+                    Arc::new(RwLock::new(
+                        CodeGraph::in_memory().expect("Failed to create in-memory graph"),
+                    ))
+                }
             }
+        } else {
+            tracing::info!("Starting with a fresh graph for a forced rebuild");
+            Arc::new(RwLock::new(
+                CodeGraph::in_memory().expect("Failed to create graph"),
+            ))
         };
 
         // Resolve extension path from binary location for model discovery
@@ -243,8 +293,10 @@ impl McpBackend {
             project_slug: slug,
             exclude_dirs,
             max_files,
+            explicit_source_files: Vec::new(),
             indexer,
             index_state,
+            last_graph_persist_succeeded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             graph_only: false,
         }
     }
@@ -590,7 +642,7 @@ impl McpBackend {
                 .map_err(|e| format!("Failed to create ~/.codegraph: {e}"))?;
         }
 
-        let mut rocks = memory::open_shared_graph_db(&db_path)
+        let mut rocks = memory::open_shared_graph_db_for_persist(&db_path)
             .map_err(|e| format!("Failed to open graph.db for persist: {e}"))?;
 
         // Write project registry entry (un-namespaced, global key)
@@ -631,6 +683,27 @@ impl McpBackend {
             self.project_slug
         );
         Ok(())
+    }
+
+    /// Persist one graph snapshot and commit the file hashes through the
+    /// shared Indexer gate. The boolean records graph durability separately
+    /// from checkpoint durability for the forced-reindex response path.
+    async fn persist_graph_and_finalize_index(&self) -> Result<(), String> {
+        let graph_persisted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let persisted = Arc::clone(&graph_persisted);
+        let result = self
+            .indexer
+            .persist_graph_snapshot(&self.graph, |graph| {
+                let result = self.persist_graph(graph);
+                persisted.store(result.is_ok(), std::sync::atomic::Ordering::Release);
+                result
+            })
+            .await;
+        self.last_graph_persist_succeeded.store(
+            graph_persisted.load(std::sync::atomic::Ordering::Acquire),
+            std::sync::atomic::Ordering::Release,
+        );
+        result
     }
 
     /// List all projects indexed in the shared graph database.
@@ -906,10 +979,11 @@ impl McpBackend {
         })
     }
 
-    /// Save current file hashes to disk for persistence across restarts.
+    /// Persist the graph before saving the hashes that describe it.
     pub async fn save_index_state(&self) {
-        let state = self.index_state.lock().await;
-        state.save();
+        if let Err(error) = self.persist_graph_and_finalize_index().await {
+            tracing::warn!("Failed to persist graph before index state: {}", error);
+        }
     }
 
     /// Load saved file hashes from disk. Returns true if state was loaded.
@@ -947,6 +1021,13 @@ impl McpBackend {
         IndexConfig {
             exclude_dirs,
             max_files: self.max_files,
+            explicit_source_files: self.explicit_source_files.clone(),
+            explicit_source_extensions: self
+                .parsers
+                .supported_extensions()
+                .iter()
+                .map(|extension| extension.trim_start_matches('.').to_string())
+                .collect(),
             ..IndexConfig::default()
         }
     }
@@ -969,20 +1050,20 @@ impl McpBackend {
             }
         }
 
-        // Delegate to the shared Indexer (handles dir walk, hashing, cross-file
-        // imports, runtime deps, and index state persistence)
+        // Delegate to the shared Indexer (walks, hashes, parses, and resolves
+        // imports). Durable hashes are committed only after graph persistence.
         let result = self
             .indexer
             .index_workspace(&self.graph, &self.workspace_folders, &config)
             .await;
 
         // Persist graph to shared database
-        {
+        let persist_result = {
             let _phase = crate::crash_phase::enter("index_persist");
-            let graph = self.graph.read().await;
-            if let Err(e) = self.persist_graph(&graph) {
-                tracing::warn!("Failed to persist graph: {}", e);
-            }
+            self.persist_graph_and_finalize_index().await
+        };
+        if let Err(error) = persist_result {
+            tracing::warn!("Failed to persist graph and index state: {}", error);
         }
 
         // Rebuild indexes if files were parsed OR graph was loaded from persistence
@@ -1096,9 +1177,11 @@ impl McpBackend {
     /// Removes old nodes for each file before re-parsing (safe for updates).
     /// Also detects and re-indexes direct dependents (files that called or
     /// imported symbols from the updated files) to keep edges consistent.
-    pub async fn add_files_to_index(&self, paths: &[PathBuf]) -> (usize, usize) {
+    pub async fn add_files_to_index(&self, paths: &[PathBuf]) -> Result<(usize, usize), String> {
         let mut indexed = 0;
         let mut failed = 0;
+        let mut graph_changed = false;
+        let mut state_changed = false;
         let mut dependent_files: std::collections::HashSet<PathBuf> =
             std::collections::HashSet::new();
 
@@ -1139,16 +1222,17 @@ impl McpBackend {
             {
                 let mut graph = self.graph.write().await;
                 let path_str = path.to_string_lossy().to_string();
-                if let Ok(old_nodes) = graph.query().property("path", path_str.as_str()).execute() {
-                    for old_id in old_nodes {
-                        let _ = graph.delete_node(old_id);
-                    }
+                let old_nodes = graph.nodes_by_path(&path_str);
+                graph_changed |= !old_nodes.is_empty();
+                for old_id in old_nodes {
+                    let _ = graph.delete_node(old_id);
                 }
             }
 
             // Clear hash so index_file doesn't skip (we already deleted old nodes above)
             {
                 let mut state = self.index_state.lock().await;
+                state_changed |= state.get_hash(path).is_some();
                 state.remove(path);
             }
 
@@ -1179,21 +1263,28 @@ impl McpBackend {
                 {
                     let mut graph = self.graph.write().await;
                     let path_str = dep_path.to_string_lossy().to_string();
-                    if let Ok(old_nodes) =
-                        graph.query().property("path", path_str.as_str()).execute()
-                    {
-                        for old_id in old_nodes {
-                            let _ = graph.delete_node(old_id);
-                        }
+                    let old_nodes = graph.nodes_by_path(&path_str);
+                    graph_changed |= !old_nodes.is_empty();
+                    for old_id in old_nodes {
+                        let _ = graph.delete_node(old_id);
                     }
                 }
-                if self.indexer.index_file(&self.graph, dep_path).await.is_ok() {
-                    indexed += 1;
+                {
+                    let mut state = self.index_state.lock().await;
+                    state_changed |= state.get_hash(dep_path).is_some();
+                    state.remove(dep_path);
+                }
+                match self.indexer.index_file(&self.graph, dep_path).await {
+                    Ok(_) => indexed += 1,
+                    Err(error) => {
+                        tracing::warn!("Failed to reindex dependent {:?}: {}", dep_path, error);
+                        failed += 1;
+                    }
                 }
             }
         }
 
-        if indexed > 0 {
+        if indexed > 0 || graph_changed {
             // Resolve cross-file imports across all files
             {
                 let mut graph = self.graph.write().await;
@@ -1201,6 +1292,7 @@ impl McpBackend {
             }
             // Rebuild query indexes
             self.query_engine.build_indexes().await;
+            self.query_engine.prune_orphan_vectors().await;
             // Incrementally re-embed updated symbols
             for path in paths.iter().chain(dependent_files.iter()) {
                 let path_str = path.to_string_lossy().to_string();
@@ -1208,15 +1300,23 @@ impl McpBackend {
             }
         }
 
-        (indexed, failed)
+        if indexed > 0 || graph_changed || state_changed {
+            self.persist_graph_and_finalize_index().await?;
+        }
+
+        Ok((indexed, failed))
     }
 
     /// Add a directory to the index without clearing existing data.
     /// Recursively indexes all supported files, resolves imports, rebuilds indexes.
-    pub async fn add_directory_to_index(&self, dir: &std::path::Path, embed: bool) -> usize {
+    pub async fn add_directory_to_index(
+        &self,
+        dir: &std::path::Path,
+        embed: bool,
+    ) -> Result<usize, String> {
         if !dir.exists() || !dir.is_dir() {
             tracing::warn!("Directory not found: {:?}", dir);
-            return 0;
+            return Ok(0);
         }
 
         let config = self.index_config();
@@ -1246,9 +1346,10 @@ impl McpBackend {
                 total,
                 embed
             );
+            self.persist_graph_and_finalize_index().await?;
         }
 
-        total
+        Ok(total)
     }
 }
 
@@ -1257,12 +1358,49 @@ pub struct McpServer {
     backend: McpBackend,
     initialized: bool,
     indexed: bool,
+    /// Whether this server keeps a filesystem watcher after indexing.
+    watch_workspace: bool,
     /// Filesystem watcher for auto-indexing on file changes
     _file_watcher: Option<super::file_watcher::McpFileWatcher>,
     /// Extension point for pro tools (community edition uses NoopProProvider)
     pro_provider: Arc<dyn super::pro_hooks::ProToolProvider>,
     /// Tool surface filter (defaults to `All` — pre-0.16.5 behavior)
     tool_profile: ToolProfile,
+}
+
+fn should_watch_workspace(one_shot_mode: bool) -> bool {
+    !one_shot_mode
+}
+
+#[cfg(test)]
+mod forced_reindex_tests {
+    use super::is_forced_reindex_request;
+    use serde_json::json;
+
+    #[test]
+    fn forced_reindex_fast_path_requires_exact_tool_and_true_flag() {
+        assert!(is_forced_reindex_request(
+            "codegraph_reindex_workspace",
+            Some(&json!({ "force": true }))
+        ));
+        assert!(!is_forced_reindex_request(
+            "codegraph_reindex_workspace",
+            Some(&json!({ "force": false }))
+        ));
+        assert!(!is_forced_reindex_request(
+            "codegraph_symbol_search",
+            Some(&json!({ "force": true }))
+        ));
+    }
+}
+
+/// Whether one-shot execution should start directly with a clean full rebuild.
+pub fn is_forced_reindex_request(tool_name: &str, tool_args: Option<&Value>) -> bool {
+    tool_name == "codegraph_reindex_workspace"
+        && tool_args
+            .and_then(|args| args.get("force"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 impl McpServer {
@@ -1283,6 +1421,26 @@ impl McpServer {
         )
     }
 
+    /// Create a server for a direct forced reindex without loading persisted
+    /// graph state or running the normal initial-index pass.
+    pub fn new_fresh(
+        workspaces: Vec<PathBuf>,
+        exclude_dirs: Vec<String>,
+        max_files: usize,
+        embedding_model: codegraph_memory::EmbeddingBackend,
+        full_body_embedding: bool,
+    ) -> Self {
+        Self::with_pro_provider_and_graph_load(
+            workspaces,
+            exclude_dirs,
+            max_files,
+            embedding_model,
+            full_body_embedding,
+            Arc::new(super::pro_hooks::NoopProProvider),
+            false,
+        )
+    }
+
     /// Create a new MCP server with a custom pro tool provider.
     pub fn with_pro_provider(
         workspaces: Vec<PathBuf>,
@@ -1292,16 +1450,47 @@ impl McpServer {
         full_body_embedding: bool,
         pro_provider: Arc<dyn super::pro_hooks::ProToolProvider>,
     ) -> Self {
+        Self::with_pro_provider_and_graph_load(
+            workspaces,
+            exclude_dirs,
+            max_files,
+            embedding_model,
+            full_body_embedding,
+            pro_provider,
+            true,
+        )
+    }
+
+    fn with_pro_provider_and_graph_load(
+        workspaces: Vec<PathBuf>,
+        exclude_dirs: Vec<String>,
+        max_files: usize,
+        embedding_model: codegraph_memory::EmbeddingBackend,
+        full_body_embedding: bool,
+        pro_provider: Arc<dyn super::pro_hooks::ProToolProvider>,
+        load_persisted_graph: bool,
+    ) -> Self {
         Self {
-            backend: McpBackend::new(
-                workspaces,
-                exclude_dirs,
-                max_files,
-                embedding_model,
-                full_body_embedding,
-            ),
+            backend: if load_persisted_graph {
+                McpBackend::new(
+                    workspaces,
+                    exclude_dirs,
+                    max_files,
+                    embedding_model,
+                    full_body_embedding,
+                )
+            } else {
+                McpBackend::new_fresh(
+                    workspaces,
+                    exclude_dirs,
+                    max_files,
+                    embedding_model,
+                    full_body_embedding,
+                )
+            },
             initialized: false,
             indexed: false,
+            watch_workspace: true,
             _file_watcher: None,
             pro_provider,
             tool_profile: ToolProfile::All,
@@ -1312,6 +1501,15 @@ impl McpServer {
     /// `run()` to take effect. Returns self for builder-style chaining.
     pub fn with_tool_profile(mut self, profile: ToolProfile) -> Self {
         self.tool_profile = profile;
+        self
+    }
+
+    /// Keep caller-selected source files indexed across workspace walks and
+    /// watched for edits. These are file paths, not additional roots; shared
+    /// workspace filters still enforce containment, supported-source, size,
+    /// secret-pattern and symlink checks.
+    pub fn with_explicit_source_files(mut self, files: Vec<PathBuf>) -> Self {
+        self.backend.explicit_source_files = files;
         self
     }
 
@@ -1338,7 +1536,17 @@ impl McpServer {
         tool_name: &str,
         tool_args: Option<Value>,
     ) -> Result<Value, String> {
-        self.ensure_indexed().await;
+        // This process indexes once, answers one request, and exits; a
+        // recursive watcher has no useful lifetime here and can register a
+        // very large tree just before shutdown.
+        self.watch_workspace = should_watch_workspace(true);
+        if is_forced_reindex_request(tool_name, tool_args.as_ref()) {
+            // The reindex tool performs the one full parse itself. Skipping
+            // ensure_indexed avoids first hashing/parsing stale workspace data.
+            self.indexed = true;
+        } else {
+            self.ensure_indexed().await;
+        }
         self.execute_tool(tool_name, tool_args).await
     }
 
@@ -1457,16 +1665,21 @@ impl McpServer {
         );
 
         // Start filesystem watcher for auto-indexing on file changes
-        if self._file_watcher.is_none() {
+        if self.watch_workspace && self._file_watcher.is_none() {
+            let persistence_backend = self.backend.clone();
             match super::file_watcher::McpFileWatcher::start(
                 Arc::clone(&self.backend.graph),
                 Arc::clone(&self.backend.parsers),
                 Arc::clone(&self.backend.query_engine),
+                Arc::clone(&self.backend.indexer),
+                Arc::new(move |graph| persistence_backend.persist_graph(graph)),
                 &self.backend.workspace_folders,
                 // The config the initial index was built with, so the watcher
                 // excludes exactly what the index excluded.
                 &self.backend.index_config(),
-            ) {
+            )
+            .await
+            {
                 Ok(watcher) => {
                     self._file_watcher = Some(watcher);
                 }
@@ -2150,8 +2363,7 @@ impl McpServer {
                 let line = args.get("line").and_then(|v| v.as_u64()).map(|v| v as u32);
                 let node_id = args
                     .get("nodeId")
-                    .or_else(|| args.get("node_id"))
-                    .and_then(|v| v.as_str());
+                    .or_else(|| args.get("node_id"));
                 let depth = args
                     .get("depth")
                     .and_then(|v| v.as_u64())
@@ -2159,8 +2371,8 @@ impl McpServer {
                     .unwrap_or(1);
 
                 // Use fallback for uri+line, exact match for node_id
-                let (start_node, used_fallback) = if let Some(id_str) = node_id {
-                    (parse_node_id(id_str), false)
+                let (start_node, used_fallback) = if let Some(id_value) = node_id {
+                    (parse_node_id(id_value), false)
                 } else if let (Some(u), Some(l)) = (uri, line) {
                     match self.find_nearest_node_with_fallback(u, l).await {
                         Some((id, fallback)) => (Some(id), fallback),
@@ -2194,8 +2406,7 @@ impl McpServer {
                 let line = args.get("line").and_then(|v| v.as_u64()).map(|v| v as u32);
                 let node_id = args
                     .get("nodeId")
-                    .or_else(|| args.get("node_id"))
-                    .and_then(|v| v.as_str());
+                    .or_else(|| args.get("node_id"));
                 let depth = args
                     .get("depth")
                     .and_then(|v| v.as_u64())
@@ -2203,8 +2414,8 @@ impl McpServer {
                     .unwrap_or(1);
 
                 // Use fallback for uri+line, exact match for node_id
-                let (start_node, used_fallback) = if let Some(id_str) = node_id {
-                    (parse_node_id(id_str), false)
+                let (start_node, used_fallback) = if let Some(id_value) = node_id {
+                    (parse_node_id(id_value), false)
                 } else if let (Some(u), Some(l)) = (uri, line) {
                     match self.find_nearest_node_with_fallback(u, l).await {
                         Some((id, fallback)) => (Some(id), fallback),
@@ -2239,8 +2450,7 @@ impl McpServer {
                 let node_id = args
                     .get("startNodeId")
                     .or_else(|| args.get("nodeId"))
-                    .or_else(|| args.get("node_id"))
-                    .and_then(|v| v.as_str());
+                    .or_else(|| args.get("node_id"));
                 let direction_str = args
                     .get("direction")
                     .and_then(|v| v.as_str())
@@ -2258,8 +2468,8 @@ impl McpServer {
                     .unwrap_or(100);
 
                 // Use fallback for uri+line, exact match for node_id
-                let (start_node, used_fallback) = if let Some(id_str) = node_id {
-                    (parse_node_id(id_str), false)
+                let (start_node, used_fallback) = if let Some(id_value) = node_id {
+                    (parse_node_id(id_value), false)
                 } else if let (Some(u), Some(l)) = (uri, line) {
                     match self.find_nearest_node_with_fallback(u, l).await {
                         Some((id, fallback)) => (Some(id), fallback),
@@ -2378,8 +2588,7 @@ impl McpServer {
                 let line = args.get("line").and_then(|v| v.as_u64()).map(|v| v as u32);
                 let node_id = args
                     .get("nodeId")
-                    .or_else(|| args.get("node_id"))
-                    .and_then(|v| v.as_str());
+                    .or_else(|| args.get("node_id"));
                 let include_refs = args
                     .get("includeReferences")
                     .or_else(|| args.get("include_references"))
@@ -2387,8 +2596,8 @@ impl McpServer {
                     .unwrap_or(false);
 
                 // Use fallback for uri+line, exact match for node_id
-                let (target_node, used_fallback) = if let Some(id_str) = node_id {
-                    (parse_node_id(id_str), false)
+                let (target_node, used_fallback) = if let Some(id_value) = node_id {
+                    (parse_node_id(id_value), false)
                 } else if let (Some(u), Some(l)) = (uri, line) {
                     match self.find_nearest_node_with_fallback(u, l).await {
                         Some((id, fallback)) => (Some(id), fallback),
@@ -2426,8 +2635,7 @@ impl McpServer {
                 let line = args.get("line").and_then(|v| v.as_u64()).map(|v| v as u32);
                 let node_id = args
                     .get("nodeId")
-                    .or_else(|| args.get("node_id"))
-                    .and_then(|v| v.as_str());
+                    .or_else(|| args.get("node_id"));
                 let include_source = args
                     .get("includeSource")
                     .or_else(|| args.get("include_source"))
@@ -2445,8 +2653,8 @@ impl McpServer {
                     .unwrap_or(true);
 
                 // Use fallback for uri+line, exact match for node_id
-                let (target_node, used_fallback) = if let Some(id_str) = node_id {
-                    (parse_node_id(id_str), false)
+                let (target_node, used_fallback) = if let Some(id_value) = node_id {
+                    (parse_node_id(id_value), false)
                 } else if let (Some(u), Some(l)) = (uri, line) {
                     match self.find_nearest_node_with_fallback(u, l).await {
                         Some((id, fallback)) => (Some(id), fallback),
@@ -3426,7 +3634,11 @@ impl McpServer {
                         *graph = codegraph::CodeGraph::in_memory()
                             .map_err(|e| format!("Failed to create new graph: {}", e))?;
                     }
-                    self.backend.index_state.lock().await.clear();
+                    self.backend
+                        .index_state
+                        .lock()
+                        .await
+                        .invalidate_saved_state();
                 }
                 // else: incremental — index_file skips unchanged files via hash cache
 
@@ -3438,6 +3650,16 @@ impl McpServer {
                     parsed,
                     total - parsed
                 );
+                if !self
+                    .backend
+                    .last_graph_persist_succeeded
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(
+                        "Reindex completed in memory, but graph persistence failed; index hashes were invalidated. Retry when the shared graph database is available."
+                            .to_string(),
+                    );
+                }
 
                 // Embed any new/changed symbols so semantic search reflects the reindex.
                 if !self.backend.graph_only {
@@ -3492,7 +3714,7 @@ impl McpServer {
                     })
                     .collect();
 
-                let (indexed, failed) = self.backend.add_files_to_index(&paths).await;
+                let (indexed, failed) = self.backend.add_files_to_index(&paths).await?;
 
                 Ok(serde_json::json!({
                     "status": if failed == 0 { "success" } else { "partial" },
@@ -3511,7 +3733,7 @@ impl McpServer {
                 let embed = args.get("embed").and_then(|v| v.as_bool()).unwrap_or(false);
                 let dir = PathBuf::from(path);
 
-                let count = self.backend.add_directory_to_index(&dir, embed).await;
+                let count = self.backend.add_directory_to_index(&dir, embed).await?;
 
                 Ok(serde_json::json!({
                     "status": "success",
@@ -5006,15 +5228,106 @@ impl McpServer {
     }
 }
 
-/// Parse a string into a NodeId
-fn parse_node_id(s: &str) -> Option<codegraph::NodeId> {
-    // NodeId is u64 in codegraph
-    s.parse::<codegraph::NodeId>().ok()
+/// Accept node IDs as returned by search or as decimal strings.
+fn parse_node_id(value: &Value) -> Option<codegraph::NodeId> {
+    value.as_u64().or_else(|| value.as_str()?.parse().ok())
+}
+
+#[cfg(test)]
+mod node_id_tests {
+    use super::parse_node_id;
+    use serde_json::json;
+
+    #[test]
+    fn accepts_unsigned_numbers_and_decimal_strings() {
+        assert_eq!(parse_node_id(&json!(1566646)), Some(1566646));
+        assert_eq!(parse_node_id(&json!("1566646")), Some(1566646));
+        assert_eq!(parse_node_id(&json!(u64::MAX)), Some(u64::MAX));
+        for value in [json!(-1), json!(1.5), json!("-1"), json!("bad"), json!(null)] {
+            assert_eq!(parse_node_id(&value), None);
+        }
+    }
 }
 
 #[cfg(test)]
 mod quarantine_tests {
-    use super::McpBackend;
+    use super::{should_watch_workspace, McpBackend};
+    use crate::index_state::IndexState;
+
+    #[test]
+    fn one_shot_mode_does_not_start_a_workspace_watcher() {
+        assert!(!should_watch_workspace(true));
+        assert!(should_watch_workspace(false));
+    }
+
+    #[tokio::test]
+    async fn incremental_file_and_directory_tools_commit_restart_hash_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("codegraph-harness-mcp-index-tools");
+        let source = workspace.join("src");
+        let extra = workspace.join("extra");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        let first = source.join("first.rs");
+        let second = extra.join("second.rs");
+        std::fs::write(&first, "pub fn first_incremental_symbol() {}\n").unwrap();
+        std::fs::write(&second, "pub fn second_incremental_symbol() {}\n").unwrap();
+
+        let backend = McpBackend::new_fresh(
+            vec![workspace.clone()],
+            Vec::new(),
+            100,
+            codegraph_memory::EmbeddingBackend::default(),
+            false,
+        );
+        assert_eq!(
+            backend.add_files_to_index(&[first.clone()]).await.unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            backend.add_directory_to_index(&extra, false).await.unwrap(),
+            1
+        );
+        assert!(backend
+            .last_graph_persist_succeeded
+            .load(std::sync::atomic::Ordering::Acquire));
+
+        // Restart reads the same checkpoint the MCP operations acknowledged.
+        let mut restored = IndexState::for_workspace(&backend.project_slug, &workspace);
+        assert_eq!(restored.load(), 2);
+        assert!(restored.get_hash(&first).is_some());
+        assert!(restored.get_hash(&second).is_some());
+        let graph = backend.graph.read().await;
+        assert!(graph.iter_nodes().any(
+            |(_, node)| node.properties.get_string("name") == Some("first_incremental_symbol")
+        ));
+        assert!(graph.iter_nodes().any(
+            |(_, node)| node.properties.get_string("name") == Some("second_incremental_symbol")
+        ));
+    }
+
+    #[tokio::test]
+    async fn dependent_parse_failure_is_reported() {
+        use codegraph::{EdgeType, PropertyMap};
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("codegraph-harness-dependent-failure");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let first = workspace.join("first.rs");
+        let dependent = workspace.join("dependent.rs");
+        std::fs::write(&first, "pub fn first() {}\n").unwrap();
+        std::fs::write(&dependent, "pub fn dependent() {}\n").unwrap();
+        let backend = McpBackend::new_fresh(vec![workspace], Vec::new(), 100,
+            codegraph_memory::EmbeddingBackend::default(), false);
+        assert_eq!(backend.add_files_to_index(&[first.clone(), dependent.clone()]).await.unwrap(), (2, 0));
+        {
+            let mut graph = backend.graph.write().await;
+            let target = graph.iter_nodes().find(|(_, node)| node.properties.get_string("name") == Some("first")).unwrap().0;
+            let caller = graph.iter_nodes().find(|(_, node)| node.properties.get_string("name") == Some("dependent")).unwrap().0;
+            graph.add_edge(caller, target, EdgeType::Calls, PropertyMap::new()).unwrap();
+        }
+        std::fs::write(&dependent, [0xff]).unwrap();
+        assert_eq!(backend.add_files_to_index(&[first]).await.unwrap(), (1, 1));
+    }
 
     #[test]
     fn compact_serialization_drops_whitespace_losslessly() {

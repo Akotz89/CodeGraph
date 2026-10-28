@@ -19,6 +19,8 @@ pub(crate) fn find_nearest_node(
     file_path: &str,
     target_line: u32,
 ) -> Option<(NodeId, bool)> {
+    // MCP and LSP lines are zero-based; stored source locations are one-based.
+    let target_line = target_line.saturating_add(1);
     // Strategy 1: Exact containment (prefer tightest — smallest range)
     let mut best_exact: Option<(NodeId, u32)> = None; // (id, range_size)
 
@@ -27,7 +29,7 @@ pub(crate) fn find_nearest_node(
             continue;
         }
         let start = node_props::line_start(node);
-        let end = node_props::line_end(node);
+        let end = node_props::line_end_opt(node).unwrap_or(start);
         if target_line >= start && target_line <= end {
             let range_size = end.saturating_sub(start);
             if best_exact.is_none() || range_size < best_exact.unwrap().1 {
@@ -46,7 +48,7 @@ pub(crate) fn find_nearest_node(
             continue;
         }
         let start = node_props::line_start(node) as i64;
-        let end = node_props::line_end(node) as i64;
+        let end = node_props::line_end_opt(node).unwrap_or(start as u32) as i64;
         let target = target_line as i64;
 
         let distance = if start > target {
@@ -61,4 +63,24 @@ pub(crate) fn find_nearest_node(
     }
 
     best_fallback.map(|(id, _)| (id, true))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codegraph::{NodeType, PropertyMap};
+
+    #[test]
+    fn resolves_zero_based_lines_and_single_line_symbols() {
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let single = graph.add_node(NodeType::Generic, PropertyMap::new()
+            .with("path", "/test.sql")
+            .with("line_start", 23_i64)).unwrap();
+        let later = graph.add_node(NodeType::Generic, PropertyMap::new()
+            .with("path", "/test.sql")
+            .with("line_start", 41_i64)).unwrap();
+        assert_eq!(find_nearest_node(&graph, "/test.sql", 22), Some((single, false)));
+        assert_eq!(find_nearest_node(&graph, "/test.sql", 40), Some((later, false)));
+        assert_eq!(find_nearest_node(&graph, "/test.sql", 23), Some((later, true)));
+    }
 }

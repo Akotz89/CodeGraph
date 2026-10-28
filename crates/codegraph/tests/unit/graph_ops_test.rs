@@ -48,6 +48,43 @@ fn test_get_nonexistent_node() {
 }
 
 #[test]
+fn path_index_tracks_add_update_delete_and_unrestricted_mutation() {
+    let mut graph = CodeGraph::in_memory().unwrap();
+    let first = graph
+        .add_node(
+            NodeType::CodeFile,
+            PropertyMap::new().with("path", "src/first.rs"),
+        )
+        .unwrap();
+    let sibling = graph
+        .add_node(
+            NodeType::Function,
+            PropertyMap::new().with("path", "src/first.rs"),
+        )
+        .unwrap();
+
+    assert_eq!(graph.nodes_by_path("src/first.rs").len(), 2);
+    assert!(graph.nodes_by_path("src/other.rs").is_empty());
+
+    graph
+        .update_node_properties(first, PropertyMap::new().with("path", "src/second.rs"))
+        .unwrap();
+    assert_eq!(graph.nodes_by_path("src/first.rs"), vec![sibling]);
+    assert_eq!(graph.nodes_by_path("src/second.rs"), vec![first]);
+
+    graph
+        .get_node_mut(first)
+        .unwrap()
+        .set_property("path", "src/third.rs");
+    assert_eq!(graph.nodes_by_path("src/second.rs").len(), 0);
+    assert_eq!(graph.nodes_by_path("src/third.rs"), vec![first]);
+
+    graph.delete_node(sibling).unwrap();
+    assert!(graph.nodes_by_path("src/first.rs").is_empty());
+    assert_eq!(graph.nodes_by_path("src/third.rs"), vec![first]);
+}
+
+#[test]
 fn test_add_edge_with_validation() {
     let mut graph = CodeGraph::in_memory().unwrap();
 

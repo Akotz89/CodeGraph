@@ -462,6 +462,12 @@ impl CodeGraphBackend {
             }
         };
 
+        let project_slug = self
+            .workspace_folders
+            .read()
+            .await
+            .first()
+            .map(|path| crate::memory::project_slug(path));
         let result = crate::domain::impact::analyze_impact(
             &self.graph,
             &self.query_engine,
@@ -469,7 +475,7 @@ impl CodeGraphBackend {
             &params.analysis_type,
             false,
             None,
-            None, // LSP doesn't have project slug
+            project_slug.as_deref(),
         )
         .await;
 
@@ -1042,6 +1048,13 @@ mod tests {
     #[tokio::test]
     async fn test_handle_analyze_impact_with_references() {
         let (backend, _func1_id, _func2_id) = create_backend_with_calls().await;
+        backend
+            .workspace_folders
+            .write()
+            .await
+            .push(std::path::PathBuf::from(
+                "/tmp/codegraph-harness-impact-test",
+            ));
 
         // Analyze impact on func2 which is called by func1
         // Position within func2 (lines 15-25, so 0-indexed = 14-24)

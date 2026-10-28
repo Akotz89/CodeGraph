@@ -48,6 +48,12 @@ struct Args {
     #[arg(long, short)]
     exclude: Vec<String>,
 
+    /// Exact source file to index and keep fresh, even under an excluded
+    /// examples/dist directory. May be repeated; no containing directory is
+    /// added to the index.
+    #[arg(long = "include-file", value_name = "PATH")]
+    include_files: Vec<PathBuf>,
+
     /// Maximum number of files to index (default: 5000)
     #[arg(long, default_value = "5000")]
     max_files: usize,
@@ -409,6 +415,28 @@ async fn run() {
         return;
     }
 
+    // A private store has one writer for its whole lifetime. Otherwise an
+    // older in-memory snapshot can overwrite a newer graph and index state.
+    let _state_writer_lock = if let Some(root) = std::env::var_os("CODEGRAPH_STATE_DIR") {
+        let root = std::path::PathBuf::from(root);
+        if !root.is_absolute() {
+            eprintln!("CODEGRAPH_STATE_DIR must be an absolute path");
+            std::process::exit(2);
+        }
+        if let Err(e) = std::fs::create_dir_all(&root) {
+            eprintln!("Cannot create CodeGraph state directory: {e}");
+            std::process::exit(1);
+        }
+        let file = std::fs::OpenOptions::new().create(true).read(true).write(true).open(root.join("writer.lock")).unwrap_or_else(|e| {
+            eprintln!("Cannot open CodeGraph writer lock: {e}"); std::process::exit(1);
+        });
+        if let Err(e) = file.try_lock() {
+            eprintln!("CodeGraph state directory already has an active writer: {e}");
+            std::process::exit(1);
+        }
+        Some(file)
+    } else { None };
+
     // Background watcher daemon. It owns its own signal handling and clean
     // shutdown (final persist + heartbeat removal), so it runs BEFORE the global
     // process::exit signal hook below — which would otherwise abort mid-flush.
@@ -450,15 +478,30 @@ async fn run() {
                 std::process::exit(2);
             });
 
-        let mut server = codegraph_server::mcp::McpServer::new(
-            workspaces,
-            args.exclude.clone(),
-            args.max_files,
-            embedding_model,
-            args.full_body_embedding,
-        )
+        let server = if codegraph_server::mcp::server::is_forced_reindex_request(
+            &tool_name,
+            Some(&tool_args),
+        ) {
+            codegraph_server::mcp::McpServer::new_fresh(
+                workspaces,
+                args.exclude.clone(),
+                args.max_files,
+                embedding_model,
+                args.full_body_embedding,
+            )
+        } else {
+            codegraph_server::mcp::McpServer::new(
+                workspaces,
+                args.exclude.clone(),
+                args.max_files,
+                embedding_model,
+                args.full_body_embedding,
+            )
+        }
         .with_split_identifiers(args.split_identifiers)
+        .with_explicit_source_files(args.include_files.clone())
         .with_graph_only(args.graph_only);
+        let mut server = server;
 
         match server.run_single_tool(&tool_name, Some(tool_args)).await {
             Ok(result) => {
@@ -540,6 +583,7 @@ async fn run() {
             args.full_body_embedding,
         )
         .with_split_identifiers(args.split_identifiers)
+        .with_explicit_source_files(args.include_files)
         .with_tool_profile(tool_profile)
         .with_graph_only(args.graph_only);
         codegraph_server::crash_phase::mark("serving");

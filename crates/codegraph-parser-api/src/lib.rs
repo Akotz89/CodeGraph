@@ -71,6 +71,7 @@ pub mod errors;
 pub mod ir;
 pub mod metrics;
 pub mod relationships;
+pub mod source_encoding;
 pub mod traits;
 
 // Re-export commonly used types
@@ -86,6 +87,7 @@ pub use metrics::ParserMetrics;
 pub use relationships::{
     CallRelation, ImplementationRelation, ImportRelation, InheritanceRelation, TypeReference,
 };
+pub use source_encoding::decode_source_bytes;
 pub use traits::{CodeParser, FileInfo, ProjectInfo};
 
 #[cfg(test)]

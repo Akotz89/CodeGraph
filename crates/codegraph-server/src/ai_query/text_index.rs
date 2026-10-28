@@ -101,6 +101,15 @@ impl TextIndex {
     /// Search the index for matching documents.
     /// Returns results sorted by BM25 score (descending).
     pub fn search(&self, query: &str, limit: usize) -> Vec<TextSearchResult> {
+        self.search_with_tiebreak(query, limit, |_| 0)
+    }
+
+    pub(crate) fn search_with_tiebreak(
+        &self,
+        query: &str,
+        limit: usize,
+        rank: impl Fn(NodeId) -> u8,
+    ) -> Vec<TextSearchResult> {
         let tokens = tokenize(query);
         if tokens.is_empty() {
             return Vec::new();
@@ -149,6 +158,8 @@ impl TextIndex {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| rank(a.node_id).cmp(&rank(b.node_id)))
+                .then_with(|| a.node_id.cmp(&b.node_id))
         });
         results.truncate(limit);
         results
@@ -230,6 +241,11 @@ impl TextIndexBuilder {
         docstring: Option<&str>,
         comments: &[String],
     ) {
+        // A first insertion for a node cannot already have postings in this
+        // builder. That lets the common unique-document path append directly,
+        // without searching the entire term posting list for each token.
+        // Repeated IDs retain the old merge behavior as a rare fallback.
+        let merge_existing_node = self.doc_lengths.contains_key(&node_id);
         let mut doc_length = 0.0;
         let mut has_name_match = false;
         let mut has_docstring_match = false;
@@ -238,7 +254,13 @@ impl TextIndexBuilder {
         // Index symbol name with high weight
         let name_tokens = tokenize(name);
         for (position, token) in name_tokens.iter().enumerate() {
-            self.add_posting(node_id, token, WEIGHT_SYMBOL_NAME, position);
+            self.add_posting(
+                node_id,
+                token,
+                WEIGHT_SYMBOL_NAME,
+                position,
+                merge_existing_node,
+            );
             doc_length += 1.0;
             has_name_match = true;
         }
@@ -247,7 +269,13 @@ impl TextIndexBuilder {
         if let Some(doc) = docstring {
             let doc_tokens = tokenize(doc);
             for (position, token) in doc_tokens.iter().enumerate() {
-                self.add_posting(node_id, token, WEIGHT_DOCSTRING, position);
+                self.add_posting(
+                    node_id,
+                    token,
+                    WEIGHT_DOCSTRING,
+                    position,
+                    merge_existing_node,
+                );
                 doc_length += 1.0;
             }
             if !doc_tokens.is_empty() {
@@ -259,7 +287,13 @@ impl TextIndexBuilder {
         for comment in comments {
             let comment_tokens = tokenize(comment);
             for (position, token) in comment_tokens.iter().enumerate() {
-                self.add_posting(node_id, token, WEIGHT_COMMENT, position);
+                self.add_posting(
+                    node_id,
+                    token,
+                    WEIGHT_COMMENT,
+                    position,
+                    merge_existing_node,
+                );
                 doc_length += 1.0;
             }
             if !comment_tokens.is_empty() {
@@ -285,14 +319,36 @@ impl TextIndexBuilder {
     }
 
     /// Add a posting to the inverted index.
-    fn add_posting(&mut self, node_id: NodeId, token: &str, weight: f32, position: usize) {
+    fn add_posting(
+        &mut self,
+        node_id: NodeId,
+        token: &str,
+        weight: f32,
+        position: usize,
+        merge_existing_node: bool,
+    ) {
         let postings = self.inverted_index.entry(token.to_string()).or_default();
 
-        // Check if we already have a posting for this node
-        if let Some(existing) = postings.iter_mut().find(|p| p.node_id == node_id) {
+        // Duplicate terms within one document arrive consecutively for each
+        // term even though other tokens may be interleaved. Update the tail
+        // in O(1); only repeated add_document calls for the same NodeId need
+        // the historical full-list merge.
+        if let Some(existing) = postings.last_mut().filter(|p| p.node_id == node_id) {
             // Update term frequency and use max weight
             existing.term_frequency += 1.0;
             existing.weight = existing.weight.max(weight);
+        } else if merge_existing_node {
+            if let Some(existing) = postings.iter_mut().find(|p| p.node_id == node_id) {
+                existing.term_frequency += 1.0;
+                existing.weight = existing.weight.max(weight);
+            } else {
+                postings.push(Posting {
+                    node_id,
+                    term_frequency: 1.0,
+                    weight,
+                    position,
+                });
+            }
         } else {
             postings.push(Posting {
                 node_id,
@@ -476,6 +532,44 @@ mod tests {
         assert!(index.has_term("incoming"));
         assert!(index.has_term("processed"));
         assert!(index.has_term("result"));
+    }
+
+    #[test]
+    fn duplicate_terms_and_repeated_document_ids_preserve_posting_semantics() {
+        let mut builder = TextIndexBuilder::new();
+        builder.add_document(
+            7,
+            "shared shared",
+            Some("shared doc"),
+            &["shared note".to_string()],
+        );
+        // Exercise the rare merge path after another document has appended to
+        // the same posting list, matching the historical behavior for callers
+        // that submit a NodeId more than once.
+        builder.add_document(8, "shared", None, &[]);
+        builder.add_document(7, "shared", None, &[]);
+
+        let index = builder.build();
+        let postings = index.inverted_index.get("shared").unwrap();
+        let node_seven = postings
+            .iter()
+            .find(|posting| posting.node_id == 7)
+            .unwrap();
+        let node_eight = postings
+            .iter()
+            .find(|posting| posting.node_id == 8)
+            .unwrap();
+
+        assert_eq!(node_seven.term_frequency, 5.0);
+        assert_eq!(node_seven.weight, WEIGHT_SYMBOL_NAME);
+        assert_eq!(node_seven.position, 0);
+        assert_eq!(node_eight.term_frequency, 1.0);
+        assert_eq!(node_eight.weight, WEIGHT_SYMBOL_NAME);
+        assert_eq!(index.document_count(), 3);
+
+        let results = index.search("shared", 2);
+        assert_eq!(results[0].node_id, 7);
+        assert!(results[0].score > results[1].score);
     }
 
     // ============================================

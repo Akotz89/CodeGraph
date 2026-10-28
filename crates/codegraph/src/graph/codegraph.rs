@@ -23,6 +23,9 @@ pub struct CodeGraph {
     edge_counter: EdgeId,
     // In-memory caches for fast lookups
     nodes: HashMap<NodeId, Node>,
+    // Lazily-built exact path index used by file replacement. `None` means
+    // an unrestricted mutable node reference may have changed a path.
+    nodes_by_path: Option<HashMap<String, HashSet<NodeId>>>,
     edges: HashMap<EdgeId, Edge>,
     // Adjacency indexes for O(1) neighbor lookups
     adjacency_out: HashMap<NodeId, HashSet<EdgeId>>,
@@ -43,6 +46,7 @@ impl CodeGraph {
             node_counter: 0,
             edge_counter: 0,
             nodes: HashMap::new(),
+            nodes_by_path: None,
             edges: HashMap::new(),
             adjacency_out: HashMap::new(),
             adjacency_in: HashMap::new(),
@@ -116,6 +120,7 @@ impl CodeGraph {
 
         // Update in-memory cache
         self.nodes.insert(node_id, node);
+        self.index_node_path(node_id);
         trace!("Node {node_id} added successfully");
 
         Ok(node_id)
@@ -138,6 +143,9 @@ impl CodeGraph {
     ///
     /// Returns [`GraphError::NodeNotFound`] if the node doesn't exist.
     pub fn get_node_mut(&mut self, id: NodeId) -> Result<&mut Node> {
+        // Callers can mutate arbitrary properties through this reference, so
+        // invalidate the derived path index and rebuild it on next use.
+        self.nodes_by_path = None;
         self.nodes
             .get_mut(&id)
             .ok_or_else(|| GraphError::NodeNotFound {
@@ -153,19 +161,34 @@ impl CodeGraph {
     ///
     /// Returns error if node not found or persistence fails.
     pub fn update_node_properties(&mut self, id: NodeId, properties: PropertyMap) -> Result<()> {
-        let node = self.get_node_mut(id)?;
+        let old_path = self
+            .nodes
+            .get(&id)
+            .ok_or_else(|| GraphError::NodeNotFound {
+                node_id: id.to_string(),
+            })?
+            .properties
+            .get_string("path")
+            .map(str::to_owned);
 
         // Merge properties
+        let node = self.nodes.get_mut(&id).expect("node was checked above");
         for (key, value) in properties.iter() {
             node.properties.insert(key.clone(), value.clone());
         }
+        let new_path = node.properties.get_string("path").map(str::to_owned);
 
         // Persist updated node
         let key = format!("node:{id}");
         let value = serde_json::to_vec(node)
             .map_err(|e| GraphError::serialization("Failed to serialize node", Some(e)))?;
 
-        self.storage.put(key.as_bytes(), &value)?;
+        if let Err(error) = self.storage.put(key.as_bytes(), &value) {
+            self.nodes_by_path = None;
+            return Err(error.into());
+        }
+
+        self.update_indexed_path(id, old_path.as_deref(), new_path.as_deref());
 
         Ok(())
     }
@@ -183,6 +206,11 @@ impl CodeGraph {
                 node_id: id.to_string(),
             });
         }
+        let old_path = self
+            .nodes
+            .get(&id)
+            .and_then(|node| node.properties.get_string("path"))
+            .map(str::to_owned);
 
         // Find and delete all connected edges
         let mut edges_to_delete = Vec::new();
@@ -210,6 +238,7 @@ impl CodeGraph {
 
         // Remove from cache
         self.nodes.remove(&id);
+        self.remove_indexed_path(id, old_path.as_deref());
 
         Ok(())
     }
@@ -471,6 +500,7 @@ impl CodeGraph {
             });
 
             self.nodes.insert(node_id, node);
+            self.index_node_path(node_id);
             node_ids.push(node_id);
         }
 
@@ -539,6 +569,69 @@ impl CodeGraph {
         self.nodes.len()
     }
 
+    /// Return IDs of nodes whose `path` property exactly matches `path`.
+    /// The index is built once from the loaded graph and maintained by graph
+    /// mutations. Direct mutable node access invalidates it conservatively.
+    pub fn nodes_by_path(&mut self, path: &str) -> Vec<NodeId> {
+        if self.nodes_by_path.is_none() {
+            let mut index: HashMap<String, HashSet<NodeId>> = HashMap::new();
+            for (&id, node) in &self.nodes {
+                if let Some(path) = node.properties.get_string("path") {
+                    index.entry(path.to_owned()).or_default().insert(id);
+                }
+            }
+            self.nodes_by_path = Some(index);
+        }
+        self.nodes_by_path
+            .as_ref()
+            .and_then(|index| index.get(path))
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn index_node_path(&mut self, id: NodeId) {
+        let path = self
+            .nodes
+            .get(&id)
+            .and_then(|node| node.properties.get_string("path"))
+            .map(str::to_owned);
+        if let (Some(index), Some(path)) = (&mut self.nodes_by_path, path) {
+            index.entry(path).or_default().insert(id);
+        }
+    }
+
+    fn remove_indexed_path(&mut self, id: NodeId, path: Option<&str>) {
+        if let Some(index) = &mut self.nodes_by_path {
+            if let Some(path) = path {
+                if let Some(ids) = index.get_mut(path) {
+                    ids.remove(&id);
+                    if ids.is_empty() {
+                        index.remove(path);
+                    }
+                }
+            }
+        }
+    }
+
+    fn update_indexed_path(&mut self, id: NodeId, old_path: Option<&str>, new_path: Option<&str>) {
+        if old_path == new_path {
+            return;
+        }
+        if let Some(index) = &mut self.nodes_by_path {
+            if let Some(path) = old_path {
+                if let Some(ids) = index.get_mut(path) {
+                    ids.remove(&id);
+                    if ids.is_empty() {
+                        index.remove(path);
+                    }
+                }
+            }
+            if let Some(path) = new_path {
+                index.entry(path.to_owned()).or_default().insert(id);
+            }
+        }
+    }
+
     /// Iterate over all (NodeId, Node) pairs in the graph.
     pub fn nodes_iter(&self) -> impl Iterator<Item = (&NodeId, &Node)> {
         self.nodes.iter()
@@ -584,6 +677,7 @@ impl CodeGraph {
         // Clear in-memory caches
         self.edges.clear();
         self.nodes.clear();
+        self.nodes_by_path = Some(HashMap::new());
         self.adjacency_out.clear();
         self.adjacency_in.clear();
 

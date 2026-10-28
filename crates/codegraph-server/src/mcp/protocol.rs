@@ -241,7 +241,7 @@ pub struct ToolInputSchema {
 #[derive(Debug, Clone, Serialize)]
 pub struct PropertySchema {
     #[serde(rename = "type")]
-    pub property_type: String,
+    pub property_type: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

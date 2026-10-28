@@ -61,6 +61,9 @@ pub(crate) fn project_slug(workspace_path: &Path) -> String {
 
 /// `~/.codegraph` — the shared state directory.
 pub(crate) fn codegraph_home_dir() -> Result<PathBuf, MemoryError> {
+    if let Some(root) = std::env::var_os("CODEGRAPH_STATE_DIR") {
+        return Ok(PathBuf::from(root));
+    }
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .ok_or_else(|| MemoryError::Other("Cannot determine home directory".to_string()))?;
@@ -110,12 +113,48 @@ pub(crate) fn shared_graph_db_path() -> Result<PathBuf, MemoryError> {
 pub(crate) const SHARED_GRAPH_DB_LOCK_WAIT: std::time::Duration =
     std::time::Duration::from_secs(10);
 
+/// Persistence can hold RocksDB while writing a complete multi-repository
+/// graph. Give a competing writer enough time to finish instead of dropping
+/// the later project's graph at the ordinary short open timeout.
+pub(crate) const SHARED_GRAPH_DB_PERSIST_LOCK_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
 /// Open the shared graph DB at `path`, waiting out another process that has it
 /// open. Every open of the shared DB goes through here: RocksDB admits one
 /// handle at a time, so an open that gives up at the first refusal fails
 /// whenever a sibling session happens to be persisting.
 pub(crate) fn open_shared_graph_db(path: &Path) -> codegraph::Result<codegraph::RocksDBBackend> {
     open_shared_graph_db_with(path, || {}, || {})
+}
+
+/// Open the shared graph DB for a writer, waiting through another complete
+/// graph persist. RocksDB's own lock remains the serialization point.
+pub(crate) fn open_shared_graph_db_for_persist(
+    path: &Path,
+) -> codegraph::Result<codegraph::RocksDBBackend> {
+    let started = std::time::Instant::now();
+    let mut last_warning = started;
+    let result = codegraph::RocksDBBackend::open_waiting_for_lock_with(
+        path,
+        SHARED_GRAPH_DB_PERSIST_LOCK_WAIT,
+        || {},
+        || {
+            let now = std::time::Instant::now();
+            if now.duration_since(last_warning) >= std::time::Duration::from_secs(5) {
+                tracing::warn!(
+                    "Waiting for another CodeGraph process to release graph.db for persistence"
+                );
+                last_warning = now;
+            }
+        },
+    );
+    if started.elapsed() >= std::time::Duration::from_secs(1) && result.is_ok() {
+        tracing::info!(
+            "Waited {:?} for graph.db persistence lock",
+            started.elapsed()
+        );
+    }
+    result
 }
 
 /// [`open_shared_graph_db`] with the per-attempt hooks of
@@ -185,16 +224,8 @@ fn project_data_dir(workspace_path: &Path) -> Result<PathBuf, MemoryError> {
         return Ok(workspace_path.join(".codegraph-state"));
     }
 
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or_else(|| MemoryError::Other("Cannot determine home directory".to_string()))?;
-
     let slug = project_slug(workspace_path);
-
-    Ok(PathBuf::from(home)
-        .join(".codegraph")
-        .join("projects")
-        .join(slug))
+    Ok(codegraph_home_dir()?.join("projects").join(slug))
 }
 
 /// Minimum available memory to load the ONNX embedding model + runtime
@@ -709,6 +740,23 @@ mod tests {
     use super::*;
 
     const MIN: u64 = MODEL_MIN_FREE_BYTES;
+
+    #[test]
+    fn persistence_open_waits_for_a_competing_rocksdb_writer() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("graph.db");
+        let holder = codegraph::RocksDBBackend::open(&path).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(holder);
+        });
+
+        let started = std::time::Instant::now();
+        let writer = open_shared_graph_db_for_persist(&path).unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(150));
+        drop(writer);
+        release.join().unwrap();
+    }
 
     #[test]
     fn gate_loads_when_ample_memory() {

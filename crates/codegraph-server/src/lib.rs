@@ -28,6 +28,7 @@ pub static __libc_single_threaded: glibc_compat::SingleThreaded =
 pub mod ai_query;
 pub mod backend;
 pub mod branch_watcher;
+mod build_parser;
 pub mod cache;
 pub mod crash_phase;
 pub mod custom_requests;
@@ -48,6 +49,7 @@ pub mod memory;
 pub mod metadata;
 pub mod parser_registry;
 pub mod runtime_deps;
+mod sql_parser;
 pub mod telemetry;
 pub mod watcher;
 
