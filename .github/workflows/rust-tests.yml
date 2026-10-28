@@ -1,0 +1,19 @@
+name: Rust tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  server-tests:
+    runs-on: ubuntu-latest
+    env:
+      CXXFLAGS: -include cstdint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test CodeGraph server
+        run: cargo test --locked -p codegraph-server --lib -- --test-threads=4
