@@ -125,6 +125,7 @@ pub(crate) struct WorkspaceFilter {
     /// Canonical caller-selected source files. These are exact-file
     /// exceptions to example/build directory pruning, never directory roots.
     explicit_files: std::collections::HashSet<PathBuf>,
+    exact_cpp_files: std::collections::HashSet<PathBuf>,
 }
 
 impl WorkspaceFilter {
@@ -147,6 +148,7 @@ impl WorkspaceFilter {
         Self {
             roots,
             explicit_files,
+            exact_cpp_files: base.exact_cpp_files.iter().cloned().collect(),
         }
     }
 
@@ -156,6 +158,10 @@ impl WorkspaceFilter {
 
     pub(crate) fn is_explicit_file(&self, path: &Path) -> bool {
         canonical_candidate(path).is_some_and(|candidate| self.explicit_files.contains(&candidate))
+    }
+
+    pub(crate) fn is_exact_cpp_file(&self, path: &Path) -> bool {
+        self.exact_cpp_files.contains(path) && self.admits(path)
     }
 
     pub(crate) fn admits_explicit_parent(&self, path: &Path) -> bool {
@@ -281,7 +287,8 @@ impl WorkspaceFilter {
         // Exact includes still have to be source files. The server's parser
         // registry is the authoritative extension list; the shared filter
         // keeps this list to text source formats supported by it.
-        if !ext.is_empty() && crate::parser_registry::source_template_kind(path).is_none() && !config
+        let exact_cpp = config.exact_cpp_files.iter().any(|selected| selected == path);
+        if !ext.is_empty() && !exact_cpp && crate::parser_registry::source_template_kind(path).is_none() && !config
             .explicit_source_extensions
             .iter()
             .any(|known| known == ext)
@@ -462,6 +469,8 @@ pub struct IndexConfig {
     /// bypass only `examples`/`dist` directory pruning; file-pattern,
     /// credential, root-containment and symlink checks still apply.
     pub explicit_source_files: Vec<PathBuf>,
+    /// Exact paths explicitly declared to be C++ despite an ambiguous suffix.
+    pub exact_cpp_files: Vec<PathBuf>,
     /// Extensions supported by the caller's parser registry, without dots.
     pub explicit_source_extensions: Vec<String>,
 }
@@ -475,6 +484,7 @@ impl Default for IndexConfig {
             max_depth: 20,
             max_files: 5_000,
             explicit_source_files: Vec::new(),
+            exact_cpp_files: Vec::new(),
             explicit_source_extensions: Vec::new(),
         }
     }
@@ -841,6 +851,10 @@ impl Indexer {
         if !config.explicit_source_files.is_empty() {
             let filter = WorkspaceFilter::new(folders, config);
             for source in &config.explicit_source_files {
+                if !filter.admits(source) {
+                    tracing::warn!("Ignoring explicit source path that failed workspace filters");
+                    continue;
+                }
                 let Some(source) = canonical_candidate(source) else {
                     tracing::warn!("Ignoring explicit source path with unresolved parent");
                     continue;
@@ -1297,6 +1311,7 @@ mod tests {
             max_depth,
             max_files: 1000,
             explicit_source_files: vec![],
+            exact_cpp_files: vec![],
             explicit_source_extensions: vec![],
         }
     }
@@ -1539,6 +1554,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_cpp_mapping_indexes_only_the_named_ambiguous_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let selected = root.join("selected.inc");
+        let sibling = root.join("sibling.inc");
+        std::fs::write(&selected, "int exact_selected() { return 1; }").unwrap();
+        std::fs::write(&sibling, "int exact_sibling() { return 1; }").unwrap();
+        let parsers = Arc::new(ParserRegistry::new());
+        parsers.set_exact_cpp_files(std::slice::from_ref(&selected)).unwrap();
+        let state = Arc::new(Mutex::new(IndexState::for_workspace("exact-cpp-mapping", &root)));
+        let indexer = Indexer::new(parsers, state.clone());
+        let config = IndexConfig {
+            explicit_source_files: vec![selected.clone()],
+            exact_cpp_files: vec![selected.clone()],
+            ..IndexConfig::default()
+        };
+        let filter = WorkspaceFilter::new(std::slice::from_ref(&root), &config);
+        assert!(filter.admits(&selected));
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        indexer.index_workspace(&graph, std::slice::from_ref(&root), &config).await;
+        let hashes = state.lock().await;
+        assert!(hashes.get_hash(&selected).is_some());
+        assert!(hashes.get_hash(&sibling).is_none());
+        drop(hashes);
+        let graph = graph.read().await;
+        assert!(graph.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("exact_selected")));
+        assert!(!graph.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("exact_sibling")));
+    }
+
+    #[tokio::test]
     async fn indexes_autohotkey_without_source_values() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
@@ -1694,6 +1739,7 @@ mod tests {
             max_depth: 5,
             max_files: 100,
             explicit_source_files: vec![],
+            exact_cpp_files: vec![],
             explicit_source_extensions: vec![],
         };
         config.extend_from_codegraphignore(tmp.path());

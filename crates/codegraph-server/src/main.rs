@@ -54,6 +54,10 @@ struct Args {
     #[arg(long = "include-file", value_name = "PATH")]
     include_files: Vec<PathBuf>,
 
+    /// Exact in-workspace file to parse as C++, regardless of its suffix.
+    #[arg(long = "include-cpp-file", value_name = "PATH")]
+    include_cpp_files: Vec<PathBuf>,
+
     /// Maximum number of files to index (default: 5000)
     #[arg(long, default_value = "5000")]
     max_files: usize,
@@ -500,6 +504,8 @@ async fn run() {
         }
         .with_split_identifiers(args.split_identifiers)
         .with_explicit_source_files(args.include_files.clone())
+        .with_exact_cpp_files(args.include_cpp_files.clone())
+        .unwrap_or_else(|error| { eprintln!("Invalid C++ file override: {error}"); std::process::exit(2) })
         .with_graph_only(args.graph_only);
         let mut server = server;
 
@@ -584,6 +590,8 @@ async fn run() {
         )
         .with_split_identifiers(args.split_identifiers)
         .with_explicit_source_files(args.include_files)
+        .with_exact_cpp_files(args.include_cpp_files)
+        .unwrap_or_else(|error| { eprintln!("Invalid C++ file override: {error}"); std::process::exit(2) })
         .with_tool_profile(tool_profile)
         .with_graph_only(args.graph_only);
         codegraph_server::crash_phase::mark("serving");

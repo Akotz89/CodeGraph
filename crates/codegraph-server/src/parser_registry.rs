@@ -52,8 +52,9 @@ use codegraph_verilog::VerilogParser;
 use codegraph_yaml::YamlParser;
 #[cfg(feature = "extra-languages")]
 use codegraph_zig::ZigParser;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::collections::HashSet;
 use std::io::Read;
 
 /// Recognize only known extensionless build files or a bounded interpreter shebang.
@@ -86,6 +87,7 @@ pub(crate) fn source_template_kind(path: &Path) -> Option<&'static str> {
 
 /// Registry of all available language parsers.
 pub struct ParserRegistry {
+    exact_cpp_files: RwLock<HashSet<PathBuf>>,
     autohotkey: Arc<AutoHotkeyParser>,
     bash: Arc<BashParser>,
     build: Arc<BuildParser>,
@@ -136,6 +138,36 @@ pub struct ParserRegistry {
 }
 
 impl ParserRegistry {
+    /// Register exact paths whose otherwise ambiguous extension is C++.
+    /// Workspace admission must still enforce root, exclusion and symlink policy.
+    pub fn set_exact_cpp_files(&self, paths: &[PathBuf]) -> Result<(), String> {
+        let mut selected = HashSet::new();
+        for path in paths {
+            if !path.is_absolute() { return Err("C++ override paths must be absolute".into()); }
+            let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err("C++ override must be a regular non-symlink file".into());
+            }
+            let canonical = path.canonicalize().map_err(|e| e.to_string())?;
+            if canonical != *path {
+                return Err("C++ override path must be canonical and contain no symlinks".into());
+            }
+            if !selected.insert(canonical) {
+                return Err("duplicate C++ override path".into());
+            }
+        }
+        *self.exact_cpp_files.write().map_err(|_| "C++ override lock poisoned")? = selected;
+        Ok(())
+    }
+
+    fn is_exact_cpp_file(&self, path: &Path) -> bool {
+        path.canonicalize().ok().is_some_and(|canonical| {
+            canonical == path
+                && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+                && self.exact_cpp_files.read().is_ok_and(|files| files.contains(&canonical))
+        })
+    }
+
     /// Create a new parser registry with default configuration.
     pub fn new() -> Self {
         Self::with_config(ParserConfig::default())
@@ -145,6 +177,7 @@ impl ParserRegistry {
     pub fn with_config(config: ParserConfig) -> Self {
         Self {
             bash: Arc::new(BashParser::with_config(config.clone())),
+            exact_cpp_files: RwLock::new(HashSet::new()),
             autohotkey: Arc::new(AutoHotkeyParser::with_config(config.clone())),
             build: Arc::new(BuildParser::with_config(config.clone())),
             c: Arc::new(CParser::with_config(config.clone())),
@@ -256,6 +289,7 @@ impl ParserRegistry {
     /// C++-specific extensions (`.hpp`, `.cc`, `.cxx`, `.hh`, `.hxx`) are
     /// only claimed by the C++ parser and resolve correctly.
     pub fn parser_for_path(&self, path: &Path) -> Option<Arc<dyn CodeParser>> {
+        if self.is_exact_cpp_file(path) { return Some(self.cpp.clone()); }
         if let Some(kind) = source_template_kind(path) {
             return match kind { "bash" => Some(self.bash.clone()), "c" => Some(self.c.clone()), "cpp" => Some(self.cpp.clone()), _ => None };
         }
@@ -472,6 +506,7 @@ impl ParserRegistry {
     /// Note: `.h` files return `"c"` by convention (C-compatible headers).
     /// Use `.hpp`/`.hh`/`.hxx` for C++ headers.
     pub fn language_for_path(&self, path: &Path) -> Option<&'static str> {
+        if self.is_exact_cpp_file(path) { return Some("cpp"); }
         if let Some(kind) = source_template_kind(path) { return Some(kind); }
         if self.build.can_parse(path) {
             return Some(match path.extension().and_then(|e| e.to_str()) {
@@ -800,6 +835,51 @@ mod tests {
         assert!(registry
             .parser_for_path(&PathBuf::from("test.txt"))
             .is_none());
+    }
+
+    #[test]
+    fn exact_cpp_override_does_not_classify_other_inc_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let selected = tmp.path().join("selected.inc");
+        let sibling = tmp.path().join("sibling.inc");
+        std::fs::write(&selected, "int named_fragment() { return 1; }\n").unwrap();
+        std::fs::write(&sibling, "not C++\n").unwrap();
+        let registry = ParserRegistry::new();
+        assert!(!registry.can_parse(&selected));
+        registry.set_exact_cpp_files(std::slice::from_ref(&selected)).unwrap();
+        assert_eq!(registry.language_for_path(&selected), Some("cpp"));
+        assert!(!registry.can_parse(&sibling));
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let info = registry.parse_file(&selected, &mut graph).unwrap();
+        assert!(!info.functions.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_cpp_override_rejects_symlinks_and_duplicates() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let directory = tmp.path().join("source");
+        std::fs::create_dir(&directory).unwrap();
+        let selected = directory.join("selected.inc");
+        std::fs::write(&selected, "int selected() { return 1; }").unwrap();
+        let leaf_link = tmp.path().join("alias.inc");
+        let dir_link = tmp.path().join("alias-dir");
+        symlink(&selected, &leaf_link).unwrap();
+        symlink(&directory, &dir_link).unwrap();
+        let registry = ParserRegistry::new();
+        registry.set_exact_cpp_files(std::slice::from_ref(&selected)).unwrap();
+        assert!(registry.set_exact_cpp_files(&[selected.clone(), selected.clone()]).is_err());
+        assert!(registry.set_exact_cpp_files(&[leaf_link.clone()]).is_err());
+        assert!(registry.set_exact_cpp_files(&[dir_link.join("selected.inc")]).is_err());
+        assert!(!registry.can_parse(&leaf_link));
+        assert!(!registry.can_parse(&dir_link.join("selected.inc")));
+        assert_eq!(registry.language_for_path(&selected), Some("cpp"));
+        let moved = tmp.path().join("moved-source");
+        std::fs::rename(&directory, &moved).unwrap();
+        symlink(&moved, &directory).unwrap();
+        assert!(!registry.can_parse(&selected), "a substituted symlink must not inherit the override");
     }
 
     #[test]
