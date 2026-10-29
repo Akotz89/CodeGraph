@@ -79,6 +79,7 @@ pub(crate) fn source_template_kind(path: &Path) -> Option<&'static str> {
     let name = path.file_name()?.to_str()?;
     if name.ends_with(".sh.dist") { Some("bash") }
     else if name.ends_with(".h.in") { Some("c") }
+    else if name.ends_with(".cpp.inc") { Some("cpp") }
     else { None }
 }
 
@@ -252,7 +253,7 @@ impl ParserRegistry {
     /// only claimed by the C++ parser and resolve correctly.
     pub fn parser_for_path(&self, path: &Path) -> Option<Arc<dyn CodeParser>> {
         if let Some(kind) = source_template_kind(path) {
-            return match kind { "bash" => Some(self.bash.clone()), "c" => Some(self.c.clone()), _ => None };
+            return match kind { "bash" => Some(self.bash.clone()), "c" => Some(self.c.clone()), "cpp" => Some(self.cpp.clone()), _ => None };
         }
         if let Some(kind) = extensionless_source_kind(path) {
             return match kind {

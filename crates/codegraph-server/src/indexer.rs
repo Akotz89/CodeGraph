@@ -1509,6 +1509,35 @@ mod tests {
         assert!(g.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("fetchPlayer")));
     }
 
+    #[tokio::test]
+    async fn explicitly_selected_cpp_fragment_is_indexed_without_generic_inc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let fragment = root.join("selected.cpp.inc");
+        let sibling = root.join("unselected.cpp.inc");
+        let ambiguous = root.join("ambiguous.inc");
+        std::fs::write(&fragment, "int selected_fragment() { return 1; }\n").unwrap();
+        std::fs::write(&sibling, "int unselected_fragment() { return 2; }\n").unwrap();
+        std::fs::write(&ambiguous, "int ambiguous_fragment() { return 3; }\n").unwrap();
+        let parsers = Arc::new(ParserRegistry::new());
+        assert_eq!(parsers.language_for_path(&fragment), Some("cpp"));
+        assert_eq!(parsers.language_for_path(&ambiguous), None);
+        let state = Arc::new(Mutex::new(IndexState::for_workspace("cpp-fragment-test", &root)));
+        let indexer = Indexer::new(parsers.clone(), state.clone());
+        let mut config = IndexConfig::default();
+        config.explicit_source_files = vec![fragment.clone()];
+        config.explicit_source_extensions = parsers.supported_extensions().iter().map(|s| s.trim_start_matches('.').to_string()).collect();
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        indexer.index_workspace(&graph, std::slice::from_ref(&root), &config).await;
+        let hashes = state.lock().await;
+        assert!(hashes.get_hash(&fragment).is_some());
+        assert!(hashes.get_hash(&sibling).is_none());
+        assert!(hashes.get_hash(&ambiguous).is_none());
+        drop(hashes);
+        let g = graph.read().await;
+        assert!(g.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("selected_fragment")));
+    }
+
     #[test]
     fn workspace_filter_reads_codegraphignore_per_root() {
         let tmp = tempfile::tempdir().unwrap();
