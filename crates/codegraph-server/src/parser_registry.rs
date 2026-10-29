@@ -875,6 +875,7 @@ mod tests {
         let names: Vec<&str> = metrics.iter().map(|(n, _)| *n).collect();
         #[cfg_attr(not(feature = "extra-languages"), allow(unused_mut))]
         let mut expected = vec![
+            "autohotkey",
             "bash",
             "build",
             "c",
