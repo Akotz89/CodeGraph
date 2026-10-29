@@ -119,6 +119,7 @@ pub struct McpBackend {
     /// Caller-selected exact source files that remain indexed and watched
     /// even when their parent is an excluded example/distribution directory.
     pub explicit_source_files: Vec<PathBuf>,
+    pub exact_cpp_files: Vec<PathBuf>,
     /// Shared indexer for directory walking and file parsing
     pub indexer: Arc<Indexer>,
     /// Index state for hash persistence (shared with indexer)
@@ -294,6 +295,7 @@ impl McpBackend {
             exclude_dirs,
             max_files,
             explicit_source_files: Vec::new(),
+            exact_cpp_files: Vec::new(),
             indexer,
             index_state,
             last_graph_persist_succeeded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1022,6 +1024,7 @@ impl McpBackend {
             exclude_dirs,
             max_files: self.max_files,
             explicit_source_files: self.explicit_source_files.clone(),
+            exact_cpp_files: self.exact_cpp_files.clone(),
             explicit_source_extensions: self
                 .parsers
                 .supported_extensions()
@@ -1178,6 +1181,7 @@ impl McpBackend {
     /// Also detects and re-indexes direct dependents (files that called or
     /// imported symbols from the updated files) to keep edges consistent.
     pub async fn add_files_to_index(&self, paths: &[PathBuf]) -> Result<(usize, usize), String> {
+        let filter = crate::indexer::WorkspaceFilter::new(&self.workspace_folders, &self.index_config());
         let mut indexed = 0;
         let mut failed = 0;
         let mut graph_changed = false;
@@ -1186,6 +1190,11 @@ impl McpBackend {
             std::collections::HashSet::new();
 
         for path in paths {
+            if !filter.admits(path) {
+                tracing::warn!("File rejected by workspace filter: {:?}", path);
+                failed += 1;
+                continue;
+            }
             if !path.exists() {
                 tracing::warn!("File not found: {:?}", path);
                 failed += 1;
@@ -1257,6 +1266,10 @@ impl McpBackend {
                 dep_count
             );
             for dep_path in &dependent_files {
+                if !filter.admits(dep_path) {
+                    failed += 1;
+                    continue;
+                }
                 // Remove old nodes for dependent (index_file already removes old
                 // nodes, but we do it explicitly here in case the file was not
                 // previously indexed via the Indexer)
@@ -1511,6 +1524,22 @@ impl McpServer {
     pub fn with_explicit_source_files(mut self, files: Vec<PathBuf>) -> Self {
         self.backend.explicit_source_files = files;
         self
+    }
+
+    /// Admit only exact, workspace-contained C++ overrides. No extension-wide
+    /// classification is performed for ambiguous include files.
+    pub fn with_exact_cpp_files(mut self, files: Vec<PathBuf>) -> Result<Self, String> {
+        let mut config = self.backend.index_config();
+        config.exact_cpp_files = files.clone();
+        config.explicit_source_files.extend(files.iter().cloned());
+        let filter = crate::indexer::WorkspaceFilter::new(&self.backend.workspace_folders, &config);
+        if files.iter().any(|path| !filter.admits(path)) {
+            return Err("C++ override failed workspace admission".into());
+        }
+        self.backend.parsers.set_exact_cpp_files(&files)?;
+        self.backend.explicit_source_files.extend(files.iter().cloned());
+        self.backend.exact_cpp_files = files;
+        Ok(self)
     }
 
     /// Split run-together identifiers into words in the embedding text.
@@ -5251,13 +5280,36 @@ mod node_id_tests {
 
 #[cfg(test)]
 mod quarantine_tests {
-    use super::{should_watch_workspace, McpBackend};
+    use super::{should_watch_workspace, McpBackend, McpServer};
     use crate::index_state::IndexState;
 
     #[test]
     fn one_shot_mode_does_not_start_a_workspace_watcher() {
         assert!(!should_watch_workspace(true));
         assert!(should_watch_workspace(false));
+    }
+
+    #[tokio::test]
+    async fn exact_cpp_override_enforces_workspace_and_explicit_indexing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir_all(root.join("private")).unwrap();
+        let selected = root.join("selected.inc");
+        let outside = tmp.path().join("outside.inc");
+        let excluded = root.join("private").join("excluded.inc");
+        for path in [&selected, &outside, &excluded] {
+            std::fs::write(path, "int explicit_symbol() { return 1; }").unwrap();
+        }
+        let create = || McpServer::new_fresh(
+            vec![root.clone()], vec!["private".into()], 100,
+            codegraph_memory::EmbeddingBackend::default(), false,
+        );
+        assert!(create().with_exact_cpp_files(vec![outside.clone()]).is_err());
+        assert!(create().with_exact_cpp_files(vec![excluded.clone()]).is_err());
+        let server = create().with_exact_cpp_files(vec![selected.clone()]).unwrap();
+        assert_eq!(server.backend.add_files_to_index(&[selected.clone(), outside]).await.unwrap(), (1, 1));
+        let graph = server.backend.graph.read().await;
+        assert!(graph.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("explicit_symbol")));
     }
 
     #[tokio::test]

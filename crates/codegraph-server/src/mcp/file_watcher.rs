@@ -251,6 +251,10 @@ fn is_watchable(path: &Path, supported_extensions: &[String], filter: &Workspace
         return false;
     }
 
+    if filter.is_exact_cpp_file(path) {
+        return true;
+    }
+
     if crate::parser_registry::source_template_kind(path).is_some() {
         return filter.is_explicit_file(path);
     }
@@ -975,6 +979,42 @@ mod tests {
         checkpoint.load();
         assert!(checkpoint.get_hash(&created_dir.join("new.rs")).is_none());
         drop(watcher);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exact_cpp_override_stays_fresh_after_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let selected = root.join("selected.inc");
+        let sibling = root.join("sibling.inc");
+        std::fs::write(&selected, "int old_selected() { return 1; }").unwrap();
+        std::fs::write(&sibling, "int ignored_sibling() { return 1; }").unwrap();
+        let parsers = Arc::new(ParserRegistry::new());
+        parsers.set_exact_cpp_files(std::slice::from_ref(&selected)).unwrap();
+        let indexer = test_indexer(&root, &parsers);
+        let config = IndexConfig {
+            explicit_source_files: vec![selected.clone()],
+            exact_cpp_files: vec![selected.clone()],
+            ..IndexConfig::default()
+        };
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        indexer.index_workspace(&graph, std::slice::from_ref(&root), &config).await;
+        wait_for_name(&graph, "old_selected", true).await;
+        let query_engine = Arc::new(QueryEngine::new(Arc::clone(&graph)));
+        let _watcher = McpFileWatcher::start(
+            Arc::clone(&graph), Arc::clone(&parsers), query_engine, indexer,
+            Arc::new(|_| Ok(())), std::slice::from_ref(&root), &config,
+        ).await.unwrap();
+        std::fs::write(&selected, "int updated_selected() { return 2; }").unwrap();
+        std::fs::write(&sibling, "int changed_sibling() { return 2; }").unwrap();
+        wait_for_name(&graph, "updated_selected", true).await;
+        wait_for_name(&graph, "old_selected", false).await;
+        wait_for_name(&graph, "changed_sibling", false).await;
+        std::fs::remove_file(&selected).unwrap();
+        wait_for_name(&graph, "updated_selected", false).await;
+        std::fs::write(&selected, "int recreated_selected() { return 3; }").unwrap();
+        wait_for_name(&graph, "recreated_selected", true).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
