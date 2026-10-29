@@ -486,7 +486,10 @@ impl QueryEngine {
             base
         };
 
-        if !full_body {
+        // Bash assignment source can contain credentials. Index its name, but
+        // never include the assignment's source line in semantic embeddings.
+        if !full_body || (node.node_type == NodeType::Variable
+            && node.properties.get_string("language") == Some("bash")) {
             return base;
         }
 
@@ -4888,6 +4891,15 @@ mod tests {
         // build_embed_text's own equality guard drops it, so this predicate
         // does not need to.
         assert!(needs_word_split("foo"));
+    }
+
+    #[test]
+    fn bash_variable_embeddings_do_not_include_assignment_values() {
+        let graph = CodeGraph::in_memory().unwrap();
+        let node = codegraph::Node::new(0, NodeType::Variable,
+            PropertyMap::new().with("language", "bash").with("body_prefix", "TOKEN=fake-secret-value"));
+        let text = QueryEngine::build_embed_text(&node, 0, "TOKEN", true, false, &graph);
+        assert_eq!(text, "TOKEN");
     }
 
     #[test]

@@ -7,14 +7,19 @@ use codegraph_parser_api::{CodeIR, ModuleEntity, ParserConfig, ParserError};
 use std::path::Path;
 use tree_sitter::Parser;
 
-use crate::visitor::BashVisitor;
+use crate::visitor::{BashAssignment, BashVisitor};
 
 /// Extract code entities and relationships from Bash source code
-pub(crate) fn extract(
+#[cfg(test)]
+pub(crate) fn extract(source: &str, file_path: &Path, config: &ParserConfig) -> Result<CodeIR, ParserError> {
+    extract_with_assignments(source, file_path, config).map(|(ir, _)| ir)
+}
+
+pub(crate) fn extract_with_assignments(
     source: &str,
     file_path: &Path,
     _config: &ParserConfig,
-) -> Result<CodeIR, ParserError> {
+) -> Result<(CodeIR, Vec<BashAssignment>), ParserError> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_bash::LANGUAGE.into())
@@ -49,7 +54,7 @@ pub(crate) fn extract(
     ir.imports = visitor.imports;
     ir.calls = visitor.calls;
 
-    Ok(ir)
+    Ok((ir, visitor.assignments))
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 
 //! Implementation of the CodeParser trait for Bash
 
-use codegraph::CodeGraph;
+use codegraph::{CodeGraph, EdgeType, NodeType, PropertyMap};
 use codegraph_parser_api::{
     CodeIR, CodeParser, FileInfo, ParserConfig, ParserError, ParserMetrics, ProjectInfo,
 };
@@ -113,8 +113,21 @@ impl CodeParser for BashParser {
         graph: &mut CodeGraph,
     ) -> Result<FileInfo, ParserError> {
         let start = Instant::now();
-        let ir = extractor::extract(source, file_path, &self.config)?;
+        let (ir, assignments) = extractor::extract_with_assignments(source, file_path, &self.config)?;
         let mut file_info = self.ir_to_graph(&ir, graph, file_path)?;
+        for assignment in assignments {
+            let props = PropertyMap::new()
+                .with("name", assignment.name)
+                .with("path", file_path.display().to_string())
+                .with("language", "bash")
+                .with("kind", "variable")
+                .with("line_start", assignment.line as i64)
+                .with("line_end", assignment.line as i64);
+            let id = graph.add_node(NodeType::Variable, props)
+                .map_err(|error| ParserError::GraphError(error.to_string()))?;
+            graph.add_edge(file_info.file_id, id, EdgeType::Contains, PropertyMap::new())
+                .map_err(|error| ParserError::GraphError(error.to_string()))?;
+        }
 
         file_info.parse_time = start.elapsed();
         file_info.line_count = source.lines().count();
