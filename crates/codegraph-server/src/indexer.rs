@@ -245,6 +245,22 @@ impl WorkspaceFilter {
         let Some((root, relative, config, exclude_set)) = self.locate(path) else {
             return false;
         };
+        // A lexical in-root path can traverse a symlink outside the workspace.
+        // Apply the same canonical containment rule to watcher and direct-file
+        // admission, including deleted paths resolved via their nearest parent.
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if !canonical_candidate(path).is_some_and(|resolved| resolved.starts_with(&canonical_root)) {
+            return false;
+        }
+        let mut component_path = root.clone();
+        for component in relative.components() {
+            component_path.push(component);
+            if std::fs::symlink_metadata(&component_path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                return false;
+            }
+        }
 
         let candidate = root.join(&relative);
         let is_explicit = self.explicit_files.contains(&candidate)
@@ -1314,6 +1330,26 @@ mod tests {
             exact_cpp_files: vec![],
             explicit_source_extensions: vec![],
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_filter_rejects_traversal_and_symlinks_outside_root() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(root.join("private")).unwrap();
+        std::fs::write(outside.join("source.rs"), "fn outside() {}").unwrap();
+        std::fs::write(root.join("private/source.rs"), "fn excluded() {}").unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        symlink(root.join("private"), root.join("alias")).unwrap();
+        let filter = WorkspaceFilter::new(std::slice::from_ref(&root), &filter_config(&["private"], 20));
+        assert!(!filter.admits(&root.join("../outside/source.rs")));
+        assert!(!filter.admits(&root.join("escape/source.rs")));
+        assert!(!filter.admits(&root.join("alias/source.rs")));
     }
 
     #[test]
