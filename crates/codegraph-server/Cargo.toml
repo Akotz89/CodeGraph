@@ -18,6 +18,8 @@ name = "codegraph_server"
 path = "src/lib.rs"
 
 [dependencies]
+tree-sitter = "0.25"
+tree-sitter-autohotkey = "1.1.1"
 # LSP framework
 tower-lsp.workspace = true
 tokio.workspace = true

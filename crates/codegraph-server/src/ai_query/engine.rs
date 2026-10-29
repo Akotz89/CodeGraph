@@ -486,9 +486,9 @@ impl QueryEngine {
             base
         };
 
-        // Bash assignment source can contain credentials. Index its name, but
-        // never include the assignment's source line in semantic embeddings.
-        if !full_body || (node.node_type == NodeType::Variable
+        // AutoHotkey bodies and Bash assignment lines can contain credentials.
+        // Keep them out of semantic embeddings.
+        if !full_body || node.properties.get_string("language") == Some("autohotkey") || (node.node_type == NodeType::Variable
             && node.properties.get_string("language") == Some("bash")) {
             return base;
         }
@@ -4900,6 +4900,15 @@ mod tests {
             PropertyMap::new().with("language", "bash").with("body_prefix", "TOKEN=fake-secret-value"));
         let text = QueryEngine::build_embed_text(&node, 0, "TOKEN", true, false, &graph);
         assert_eq!(text, "TOKEN");
+    }
+
+    #[test]
+    fn autohotkey_embeddings_do_not_include_function_bodies() {
+        let graph = CodeGraph::in_memory().unwrap();
+        let node = codegraph::Node::new(0, NodeType::Function,
+            PropertyMap::new().with("language", "autohotkey").with("body_prefix", "password := synthetic_secret"));
+        let text = QueryEngine::build_embed_text(&node, 0, "Login", true, false, &graph);
+        assert_eq!(text, "Login");
     }
 
     #[test]

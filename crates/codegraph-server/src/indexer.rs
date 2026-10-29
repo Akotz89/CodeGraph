@@ -1538,6 +1538,27 @@ mod tests {
         assert!(g.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("selected_fragment")));
     }
 
+    #[tokio::test]
+    async fn indexes_autohotkey_without_source_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let script = root.join("sample.ahk");
+        std::fs::write(&script, "Login() {\n password := \"SYNTHETIC_AHK_SECRET_7921\"\n}\n").unwrap();
+        let parsers = Arc::new(ParserRegistry::new());
+        assert_eq!(parsers.language_for_path(&script), Some("autohotkey"));
+        assert!(parsers.get_parser("ahk").is_some());
+        let state = Arc::new(Mutex::new(IndexState::for_workspace("autohotkey-index-test", &root)));
+        let indexer = Indexer::new(parsers.clone(), state.clone());
+        let mut config = IndexConfig::default();
+        config.explicit_source_extensions = parsers.supported_extensions().iter().map(|s| s.trim_start_matches('.').to_string()).collect();
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        indexer.index_workspace(&graph, std::slice::from_ref(&root), &config).await;
+        assert!(state.lock().await.get_hash(&script).is_some());
+        let g = graph.read().await;
+        assert!(g.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("Login")));
+        assert!(g.iter_nodes().all(|(_, node)| !format!("{:?}", node.properties).contains("SYNTHETIC_AHK_SECRET_7921")));
+    }
+
     #[test]
     fn workspace_filter_reads_codegraphignore_per_root() {
         let tmp = tempfile::tempdir().unwrap();

@@ -26,6 +26,7 @@ pub static __libc_single_threaded: glibc_compat::SingleThreaded =
     glibc_compat::SingleThreaded::ZERO;
 
 pub mod ai_query;
+mod autohotkey_parser;
 pub mod backend;
 pub mod branch_watcher;
 mod build_parser;
