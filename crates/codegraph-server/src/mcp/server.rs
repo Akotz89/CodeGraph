@@ -1195,6 +1195,13 @@ impl McpBackend {
                 failed += 1;
                 continue;
             }
+            let needs_exact_selection = crate::parser_registry::source_template_kind(path).is_some()
+                || path.extension().is_some_and(|extension| extension == "conf" || extension == "dist");
+            if needs_exact_selection && !filter.is_explicit_file(path) {
+                tracing::warn!("File requires exact source selection: {:?}", path);
+                failed += 1;
+                continue;
+            }
             if !path.exists() {
                 tracing::warn!("File not found: {:?}", path);
                 failed += 1;
@@ -5310,6 +5317,21 @@ mod quarantine_tests {
         assert_eq!(server.backend.add_files_to_index(&[selected.clone(), outside]).await.unwrap(), (1, 1));
         let graph = server.backend.graph.read().await;
         assert!(graph.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("explicit_symbol")));
+    }
+
+    #[tokio::test]
+    async fn explicit_template_indexing_rejects_unselected_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("unit-template-admission");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let selected = workspace.join("selected.service");
+        let sibling = workspace.join("sibling.service");
+        std::fs::write(&selected, "[Service]\nExecStart=/bin/true\n").unwrap();
+        std::fs::write(&sibling, "[Service]\nExecStart=/bin/false\n").unwrap();
+        let server = McpServer::new_fresh(vec![workspace], Vec::new(), 100,
+            codegraph_memory::EmbeddingBackend::default(), false)
+            .with_explicit_source_files(vec![selected.clone()]);
+        assert_eq!(server.backend.add_files_to_index(&[selected, sibling]).await.unwrap(), (1, 1));
     }
 
     #[tokio::test]

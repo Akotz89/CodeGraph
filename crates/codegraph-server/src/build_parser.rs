@@ -424,7 +424,7 @@ impl CodeParser for BuildParser {
             self.parse_references(source, file_path, graph, "winresource")
         } else if file_path.extension().and_then(|ext| ext.to_str()) == Some("json") && self.can_parse(file_path) {
             self.parse_json_fields(source, file_path, graph)
-        } else if file_path.extension().is_some_and(|ext| ext == "conf") || file_path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".conf.dist")) {
+        } else if file_path.extension().is_some_and(|ext| ext == "conf") || file_path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".conf.dist")) || crate::parser_registry::source_template_kind(file_path) == Some("config") {
             self.parse_config_options(source, file_path, graph)
         } else if crate::parser_registry::extensionless_source_kind(file_path) == Some("makefile") {
             self.parse_references(source, file_path, graph, "makefile")

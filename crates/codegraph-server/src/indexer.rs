@@ -1620,6 +1620,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicitly_selected_unit_and_ahk_templates_are_indexed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let unit = root.join("realm.service.in");
+        let script = root.join("smoke.ahk.in");
+        let sibling = root.join("unlisted.service");
+        std::fs::write(&unit, "[Service]\nExecStart=/bin/example\n").unwrap();
+        std::fs::write(&script, "Smoke() {\n value := 1\n}\n").unwrap();
+        std::fs::write(&sibling, "[Service]\nExecStart=/bin/unlisted\n").unwrap();
+        let parsers = Arc::new(ParserRegistry::new());
+        let state = Arc::new(Mutex::new(IndexState::for_workspace("unit-ahk-templates", &root)));
+        let indexer = Indexer::new(parsers, state.clone());
+        let config = IndexConfig { explicit_source_files: vec![unit.clone(), script.clone()], ..IndexConfig::default() };
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        indexer.index_workspace(&graph, std::slice::from_ref(&root), &config).await;
+        let state = state.lock().await;
+        assert!(state.get_hash(&unit).is_some());
+        assert!(state.get_hash(&script).is_some());
+        assert!(state.get_hash(&sibling).is_none());
+    }
+
+    #[tokio::test]
     async fn indexes_autohotkey_without_source_values() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();

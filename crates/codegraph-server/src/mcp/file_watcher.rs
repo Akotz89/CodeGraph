@@ -982,6 +982,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn selected_unit_and_ahk_templates_refresh_on_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let unit = root.join("world.service.in");
+        let script = root.join("smoke.ahk.in");
+        let sibling = root.join("unlisted.service");
+        std::fs::write(&unit, "[Service]\nExecStart=/bin/true\n").unwrap();
+        std::fs::write(&script, "Before() {\n value := 1\n}\n").unwrap();
+        std::fs::write(&sibling, "[Service]\nUnlistedOption=yes\n").unwrap();
+        let parsers = Arc::new(ParserRegistry::new());
+        let indexer = test_indexer(&root, &parsers);
+        let config = IndexConfig { explicit_source_files: vec![unit.clone(), script.clone()], ..IndexConfig::default() };
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        indexer.index_workspace(&graph, std::slice::from_ref(&root), &config).await;
+        wait_for_name(&graph, "Before", true).await;
+        let query_engine = Arc::new(QueryEngine::new(Arc::clone(&graph)));
+        let _watcher = McpFileWatcher::start(Arc::clone(&graph), parsers, query_engine, indexer,
+            Arc::new(|_| Ok(())), std::slice::from_ref(&root), &config).await.unwrap();
+        std::fs::write(&unit, "[Service]\nWorkingDirectory=/srv/example\n").unwrap();
+        std::fs::write(&script, "After() {\n value := 2\n}\n").unwrap();
+        std::fs::write(&sibling, "[Service]\nStillUnlisted=yes\n").unwrap();
+        wait_for_name(&graph, "WorkingDirectory", true).await;
+        wait_for_name(&graph, "After", true).await;
+        wait_for_name(&graph, "Before", false).await;
+        wait_for_name(&graph, "StillUnlisted", false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exact_cpp_override_stays_fresh_after_edit() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("project");
