@@ -104,6 +104,12 @@ Pass `--split-identifiers=false` to keep the old behaviour.
 
 ## Configuration
 
+### Optional C/C++ call source groups
+
+`CODEGRAPH_CALL_SCOPE_MAP` accepts a JSON object mapping absolute source roots to group names. Assign roots that compile together, such as a core and its modules, to the same group. For C/C++ calls, a unique same-group function is preferred over a same-named definition in another source copy; the longest matching root wins. This is a preference, not an isolation boundary: ambiguous or missing same-group matches fall back to the existing resolver. Calls still lack enough information to resolve every namespace, overload, or constructor. Invalid JSON, relative roots, and empty group names fail indexing rather than silently disabling the map.
+
+Example: `CODEGRAPH_CALL_SCOPE_MAP='{"/project/core":"server","/project/modules":"server","/project/old":"archive"}'`
+
 ### MCP Server flags
 
 | Flag | Default | Description |

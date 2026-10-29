@@ -385,6 +385,11 @@ async fn run() {
         return;
     }
 
+    if let Err(error) = codegraph_server::watcher::validate_call_scope_configuration() {
+        eprintln!("Invalid call scope configuration: {error}");
+        std::process::exit(2);
+    }
+
     // Initialize logging
     let log_filter = if args.mcp {
         // MCP mode: more verbose logging to stderr
