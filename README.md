@@ -390,6 +390,15 @@ Additional tools available in [CodeGraph Pro](https://codegraph.astudioplus.com/
 
 HTTP handler detection: Python (FastAPI/Flask/Django), TypeScript (NestJS), Java (Spring/JAX-RS), Go (stdlib/Gin/Echo/Fiber), C# (ASP.NET), Ruby (Rails), PHP (Laravel/Symfony).
 
+The SQL adapter indexes MySQL SQL files and resolves table references where a
+single base definition exists in the configured database scope. C++ calls named
+`query`, `execute`, `exec`, `prepare`, or `PrepareStatement` can link literal
+SQL to an unambiguous table in the same source scope. Adjacent string literals,
+common C++ escapes, and `{}` value placeholders are supported; only table names
+are retained for those links. Dynamic SQL, CTEs, qualified names, unsupported
+escapes, and ambiguous definitions are not resolved by this C++ link. Existing
+indexes must reparse C++ files to add it.
+
 > **Community vs full builds:** COBOL, Fortran, Perl, Dart, Zig, and R are
 > compiled only with `--features extra-languages`. The default community binary
 > omits them — they had zero usage in telemetry and their tree-sitter grammars

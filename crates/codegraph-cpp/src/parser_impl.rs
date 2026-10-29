@@ -125,6 +125,9 @@ impl CodeParser for CppParser {
 
         let mut file_info = self.ir_to_graph(&ir, graph, file_path)?;
 
+        crate::sql_references::record(source, &file_info, graph)
+            .map_err(|e| ParserError::GraphError(e.to_string()))?;
+
         file_info.parse_time = start.elapsed();
         file_info.line_count = source.lines().count();
         file_info.byte_count = source.len();
