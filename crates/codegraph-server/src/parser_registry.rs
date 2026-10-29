@@ -80,6 +80,8 @@ pub(crate) fn extensionless_source_kind(path: &Path) -> Option<&'static str> {
 pub(crate) fn source_template_kind(path: &Path) -> Option<&'static str> {
     let name = path.file_name()?.to_str()?;
     if name.ends_with(".sh.dist") { Some("bash") }
+    else if name.ends_with(".ahk.in") { Some("autohotkey") }
+    else if name.ends_with(".service") || name.ends_with(".timer") || name.ends_with(".service.in") || name.ends_with(".timer.in") { Some("config") }
     else if name.ends_with(".h.in") { Some("c") }
     else if name.ends_with(".cpp.inc") { Some("cpp") }
     else { None }
@@ -291,7 +293,7 @@ impl ParserRegistry {
     pub fn parser_for_path(&self, path: &Path) -> Option<Arc<dyn CodeParser>> {
         if self.is_exact_cpp_file(path) { return Some(self.cpp.clone()); }
         if let Some(kind) = source_template_kind(path) {
-            return match kind { "bash" => Some(self.bash.clone()), "c" => Some(self.c.clone()), "cpp" => Some(self.cpp.clone()), _ => None };
+            return match kind { "bash" => Some(self.bash.clone()), "autohotkey" => Some(self.autohotkey.clone()), "config" => Some(self.build.clone()), "c" => Some(self.c.clone()), "cpp" => Some(self.cpp.clone()), _ => None };
         }
         if let Some(kind) = extensionless_source_kind(path) {
             return match kind {
@@ -835,6 +837,27 @@ mod tests {
         assert!(registry
             .parser_for_path(&PathBuf::from("test.txt"))
             .is_none());
+    }
+
+    #[test]
+    fn selected_unit_and_ahk_templates_use_value_safe_parsers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("realm.service.in");
+        let script = tmp.path().join("smoke.ahk.in");
+        std::fs::write(&unit, "[Service]\nExecStart=synthetic_private_value\nPassword=synthetic_secret\n").unwrap();
+        std::fs::write(&script, "Smoke() {\n value := \"synthetic_secret\"\n}\n").unwrap();
+        let registry = ParserRegistry::new();
+        assert_eq!(registry.language_for_path(&unit), Some("config"));
+        assert_eq!(registry.language_for_path(&script), Some("autohotkey"));
+        let mut graph = CodeGraph::in_memory().unwrap();
+        registry.parse_file(&unit, &mut graph).unwrap();
+        registry.parse_file(&script, &mut graph).unwrap();
+        assert!(graph.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("ExecStart")));
+        assert!(graph.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("Smoke")));
+        assert!(graph.iter_nodes().all(|(_, node)| {
+            let value = format!("{:?}", node.properties);
+            !value.contains("synthetic_private_value") && !value.contains("synthetic_secret") && !value.contains("Password")
+        }));
     }
 
     #[test]
