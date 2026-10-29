@@ -110,9 +110,32 @@ impl TextIndex {
         limit: usize,
         rank: impl Fn(NodeId) -> u8,
     ) -> Vec<TextSearchResult> {
+        self.search_with_priority(query, limit, |_| 0, |_| false, rank)
+    }
+
+    pub(crate) fn search_with_priority(
+        &self,
+        query: &str,
+        limit: usize,
+        priority: impl Fn(NodeId) -> u8,
+        priority_competitor: impl Fn(NodeId) -> bool,
+        rank: impl Fn(NodeId) -> u8,
+    ) -> Vec<TextSearchResult> {
+        self.search_with_priority_status(query, limit, priority, priority_competitor, rank)
+            .0
+    }
+
+    pub(crate) fn search_with_priority_status(
+        &self,
+        query: &str,
+        limit: usize,
+        priority: impl Fn(NodeId) -> u8,
+        priority_competitor: impl Fn(NodeId) -> bool,
+        rank: impl Fn(NodeId) -> u8,
+    ) -> (Vec<TextSearchResult>, bool) {
         let tokens = tokenize(query);
         if tokens.is_empty() {
-            return Vec::new();
+            return (Vec::new(), false);
         }
 
         let mut scores: HashMap<NodeId, f32> = HashMap::new();
@@ -154,15 +177,24 @@ impl TextIndex {
             })
             .collect();
 
+        let prefer_exact_source = results.iter().any(|result| priority(result.node_id) == 0)
+            && results
+                .iter()
+                .any(|result| priority_competitor(result.node_id));
         results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let priority = |id| if prefer_exact_source { priority(id) } else { 0 };
+            priority(a.node_id)
+                .cmp(&priority(b.node_id))
+                .then_with(|| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| rank(a.node_id).cmp(&rank(b.node_id)))
                 .then_with(|| a.node_id.cmp(&b.node_id))
         });
         results.truncate(limit);
-        results
+        (results, prefer_exact_source)
     }
 
     /// Compute inverse document frequency for a term.
@@ -797,6 +829,31 @@ mod tests {
             rare_idf > common_idf,
             "Rare term IDF ({rare_idf}) should be > common term IDF ({common_idf})"
         );
+    }
+
+    #[test]
+    fn priority_precedes_score_before_candidate_limit() {
+        let index = TextIndex::build(&[
+            (1, "PopulationController".to_string(), None, vec![]),
+            (
+                2,
+                "PopulationControllerControllerController".to_string(),
+                None,
+                vec![],
+            ),
+            (3, "population.controller".to_string(), None, vec![]),
+        ]);
+
+        let results = index.search_with_priority(
+            "PopulationController",
+            1,
+            |node_id| u8::from(node_id != 1),
+            |node_id| node_id == 3,
+            |_| 0,
+        );
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].node_id, 1);
     }
 
     // ============================================

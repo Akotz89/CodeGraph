@@ -13,12 +13,12 @@ use super::primitives::{
     SymbolInfo, SymbolLocation, SymbolMatch, SymbolSearchResult, SymbolType, TraversalDirection,
     TraversalFilter, TraversalNode, MAX_SIGNATURE_LENGTH,
 };
-use super::text_index::{TextIndex, TextIndexBuilder};
+use super::text_index::{tokenize, TextIndex, TextIndexBuilder};
 use crate::domain::node_props;
 use codegraph::{CodeGraph, Direction, EdgeType, NamespacedBackend, NodeId, NodeType};
 use codegraph_memory::VectorEngine;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::RwLock;
 
@@ -1363,13 +1363,64 @@ impl QueryEngine {
         } else {
             10
         };
-        let definition_rank = |id| {
-            graph.get_node(id).ok().map_or(1, |node| {
-                u8::from(node.properties.get_string("kind") != Some("table"))
-            })
+        let symbol_type_matches = |node_type: &NodeType| {
+            options.symbol_types.is_empty()
+                || options.symbol_types.iter().any(|st| {
+                    matches!(
+                        (st, node_type),
+                        (SymbolType::Function, NodeType::Function)
+                            | (SymbolType::Class, NodeType::Class)
+                            | (SymbolType::Variable, NodeType::Variable)
+                            | (SymbolType::Module, NodeType::Module)
+                            | (SymbolType::Interface, NodeType::Interface)
+                            | (SymbolType::Type, NodeType::Type)
+                    )
+                })
         };
-        let text_results = text_index.search_with_tiebreak(
-            query, options.limit.saturating_mul(fetch_multiplier), definition_rank,
+        let query_tokens = tokenize(query);
+        let rank_cache = Mutex::new(HashMap::<NodeId, (u8, bool, u8)>::new());
+        let ranks_for = |id| {
+            let mut rank_cache = rank_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(rank) = rank_cache.get(&id).copied() {
+                return rank;
+            }
+            let rank = graph.get_node(id).ok().map_or((1, false, 1), |node| {
+                let eligible = symbol_type_matches(&node.node_type)
+                    && (options.include_private || node_props::is_public(node));
+                let name_tokens = tokenize(node_props::name(node));
+                let exact_source_name = !node_props::path(node).is_empty()
+                    && !matches!(&node.node_type, NodeType::Module | NodeType::CodeFile)
+                    && node.properties.get_string("kind") != Some("table_reference")
+                    && !query_tokens.is_empty()
+                    && name_tokens == query_tokens;
+                let exact_source = eligible && exact_source_name;
+                let external_candidate = node.node_type == NodeType::Module
+                    && node_props::path(node).is_empty()
+                    && !query_tokens.is_empty()
+                    && query_tokens
+                        .iter()
+                        .all(|query_token| name_tokens.contains(query_token));
+                let priority_competitor = external_candidate || (!eligible && exact_source_name);
+                (
+                    u8::from(!exact_source),
+                    priority_competitor,
+                    u8::from(node.properties.get_string("kind") != Some("table")),
+                )
+            });
+            rank_cache.insert(id, rank);
+            rank
+        };
+        let exact_source_rank = |id| ranks_for(id).0;
+        let priority_competitor = |id| ranks_for(id).1;
+        let definition_rank = |id| ranks_for(id).2;
+        let (text_results, text_priority_active) = text_index.search_with_priority_status(
+            query,
+            options.limit.saturating_mul(fetch_multiplier),
+            exact_source_rank,
+            priority_competitor,
+            definition_rank,
         );
 
         // Compute semantic scores if vector engine is available
@@ -1418,27 +1469,21 @@ impl QueryEngine {
             .collect();
 
         let total_matches = all_candidate_ids.len();
+        let prefer_exact_source = text_priority_active
+            || (all_candidate_ids
+            .iter()
+            .any(|&id| exact_source_rank(id) == 0)
+            && all_candidate_ids
+                .iter()
+                .any(|&id| priority_competitor(id)));
 
         // Score and filter all candidates
         let mut scored_results = Vec::new();
         for &node_id in &all_candidate_ids {
             if let Ok(node) = graph.get_node(node_id) {
                 // Apply symbol type filter
-                if !options.symbol_types.is_empty() {
-                    let node_type_matches = options.symbol_types.iter().any(|st| {
-                        matches!(
-                            (st, &node.node_type),
-                            (SymbolType::Function, NodeType::Function)
-                                | (SymbolType::Class, NodeType::Class)
-                                | (SymbolType::Variable, NodeType::Variable)
-                                | (SymbolType::Module, NodeType::Module)
-                                | (SymbolType::Interface, NodeType::Interface)
-                                | (SymbolType::Type, NodeType::Type)
-                        )
-                    });
-                    if !node_type_matches {
-                        continue;
-                    }
+                if !symbol_type_matches(&node.node_type) {
+                    continue;
                 }
 
                 let symbol_info = self.node_to_symbol_info_opts(&graph, node_id, options.compact);
@@ -1479,9 +1524,14 @@ impl QueryEngine {
 
         // Sort by hybrid score descending
         scored_results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let priority = |id| if prefer_exact_source { exact_source_rank(id) } else { 0 };
+            priority(a.node_id)
+                .cmp(&priority(b.node_id))
+                .then_with(|| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| definition_rank(a.node_id).cmp(&definition_rank(b.node_id)))
                 .then_with(|| {
                     let external = |result: &SymbolMatch| {
@@ -3343,6 +3393,215 @@ mod tests {
             external.results[0].symbol.location.file,
             "<external dependency: RemoteLibrary.h>"
         );
+    }
+
+    #[tokio::test]
+    async fn symbol_search_prefers_parsed_python_definition_over_import_placeholder() {
+        use codegraph_parser_api::CodeParser;
+
+        let (engine, graph) = create_test_engine().await;
+        let parser = codegraph_python::PythonParser::new();
+        {
+            let mut graph = graph.write().await;
+            parser
+                .parse_source(
+                    "class PopulationController:\n    pass\n",
+                    std::path::Path::new("/workspace/controller.py"),
+                    &mut graph,
+                )
+                .unwrap();
+            parser
+                .parse_source(
+                    "from population_runtime.controller import PopulationController\n",
+                    std::path::Path::new("/workspace/consumer.py"),
+                    &mut graph,
+                )
+                .unwrap();
+            assert!(graph.iter_nodes().any(|(_, node)| {
+                node.node_type == NodeType::Module
+                    && node_props::name(node) == "population_runtime.controller"
+                    && node_props::path(node).is_empty()
+            }));
+        }
+        engine.build_indexes().await;
+
+        for query in ["PopulationController", "  Population Controller  "] {
+            let results = engine
+                .symbol_search(query, &SearchOptions::new().with_limit(1))
+                .await;
+
+            assert_eq!(results.results.len(), 1, "query: {query}");
+            assert_eq!(
+                results.results[0].symbol.location.file,
+                "/workspace/controller.py",
+                "query: {query}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn symbol_search_does_not_let_filtered_exact_symbols_consume_candidate_limit() {
+        let (engine, graph) = create_test_engine().await;
+        {
+            let mut graph = graph.write().await;
+            for index in 0..10 {
+                graph
+                    .add_node(
+                        NodeType::Class,
+                        PropertyMap::new()
+                            .with("name", "PopulationController")
+                            .with("path", format!("/workspace/ignored/{index}.py")),
+                    )
+                    .unwrap();
+            }
+            graph
+                .add_node(
+                    NodeType::Function,
+                    PropertyMap::new()
+                        .with("name", "PopulationController")
+                        .with("path", "/workspace/controller_factory.py"),
+                )
+                .unwrap();
+        }
+        engine.build_indexes().await;
+
+        let results = engine
+            .symbol_search(
+                "PopulationController",
+                &SearchOptions::new()
+                    .with_limit(1)
+                    .with_symbol_types(vec![SymbolType::Function]),
+            )
+            .await;
+
+        assert_eq!(results.results.len(), 1);
+        assert_eq!(
+            results.results[0].symbol.location.file,
+            "/workspace/controller_factory.py"
+        );
+    }
+
+    #[tokio::test]
+    async fn symbol_search_keeps_score_order_with_unrelated_external_placeholder() {
+        let (engine, graph) = create_test_engine().await;
+        {
+            let mut graph = graph.write().await;
+            graph
+                .add_node(
+                    NodeType::Class,
+                    PropertyMap::new()
+                        .with("name", "PopulationController")
+                        .with("path", "/workspace/controller.py"),
+                )
+                .unwrap();
+            graph
+                .add_node(
+                    NodeType::Function,
+                    PropertyMap::new()
+                        .with("name", "PopulationControllerControllerController")
+                        .with("path", "/workspace/controller_helpers.py"),
+                )
+                .unwrap();
+            graph
+                .add_node(
+                    NodeType::Module,
+                    PropertyMap::new().with("name", "population_runtime"),
+                )
+                .unwrap();
+        }
+        engine.build_indexes().await;
+
+        let results = engine
+            .symbol_search("PopulationController", &SearchOptions::new().with_limit(3))
+            .await;
+
+        assert_eq!(
+            results.results[0].symbol.name,
+            "PopulationControllerControllerController"
+        );
+    }
+
+    #[tokio::test]
+    async fn symbol_search_keeps_text_priority_after_placeholder_is_truncated() {
+        let (engine, graph) = create_test_engine().await;
+        {
+            let mut graph = graph.write().await;
+            graph
+                .add_node(
+                    NodeType::Class,
+                    PropertyMap::new()
+                        .with("name", "PopulationController")
+                        .with("path", "/workspace/controller.py"),
+                )
+                .unwrap();
+            graph
+                .add_node(
+                    NodeType::Function,
+                    PropertyMap::new()
+                        .with("name", "PopulationControllerControllerController")
+                        .with("path", "/workspace/controller_helpers.py"),
+                )
+                .unwrap();
+            graph
+                .add_node(
+                    NodeType::Module,
+                    PropertyMap::new().with("name", "population.controller"),
+                )
+                .unwrap();
+        }
+        engine.build_indexes().await;
+
+        let results = engine
+            .symbol_search("PopulationController", &SearchOptions::new().with_limit(1))
+            .await;
+
+        assert_eq!(results.results.len(), 1);
+        assert_eq!(results.results[0].symbol.name, "PopulationController");
+        assert_eq!(
+            results.results[0].symbol.location.file,
+            "/workspace/controller.py"
+        );
+    }
+
+    #[tokio::test]
+    async fn symbol_search_prioritizes_definitions_over_same_named_files_and_keeps_file_search() {
+        let (engine, graph) = create_test_engine().await;
+        {
+            let mut graph = graph.write().await;
+            graph
+                .add_node(
+                    NodeType::CodeFile,
+                    PropertyMap::new()
+                        .with("name", "PopulationController")
+                        .with("path", "/workspace/PopulationController.py"),
+                )
+                .unwrap();
+            graph
+                .add_node(
+                    NodeType::Class,
+                    PropertyMap::new()
+                        .with("name", "PopulationController")
+                        .with("path", "/workspace/controller.py"),
+                )
+                .unwrap();
+            graph
+                .add_node(
+                    NodeType::Module,
+                    PropertyMap::new().with("name", "population.controller"),
+                )
+                .unwrap();
+        }
+        engine.build_indexes().await;
+
+        let results = engine
+            .symbol_search("PopulationController", &SearchOptions::new().with_limit(3))
+            .await;
+
+        assert_eq!(results.results[0].symbol.location.file, "/workspace/controller.py");
+        assert!(results
+            .results
+            .iter()
+            .any(|result| result.symbol.location.file == "/workspace/PopulationController.py"));
     }
 
     #[tokio::test]
