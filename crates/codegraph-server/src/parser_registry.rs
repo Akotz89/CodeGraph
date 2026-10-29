@@ -3,6 +3,7 @@
 
 //! Parser Registry - Manages all language parsers implementing the CodeParser trait.
 
+use crate::autohotkey_parser::AutoHotkeyParser;
 use crate::build_parser::BuildParser;
 use crate::sql_parser::SqlParser;
 use codegraph::CodeGraph;
@@ -85,6 +86,7 @@ pub(crate) fn source_template_kind(path: &Path) -> Option<&'static str> {
 
 /// Registry of all available language parsers.
 pub struct ParserRegistry {
+    autohotkey: Arc<AutoHotkeyParser>,
     bash: Arc<BashParser>,
     build: Arc<BuildParser>,
     c: Arc<CParser>,
@@ -143,6 +145,7 @@ impl ParserRegistry {
     pub fn with_config(config: ParserConfig) -> Self {
         Self {
             bash: Arc::new(BashParser::with_config(config.clone())),
+            autohotkey: Arc::new(AutoHotkeyParser::with_config(config.clone())),
             build: Arc::new(BuildParser::with_config(config.clone())),
             c: Arc::new(CParser::with_config(config.clone())),
             clojure: Arc::new(ClojureParser::with_config(config.clone())),
@@ -194,6 +197,7 @@ impl ParserRegistry {
     /// Get parser by language identifier.
     pub fn get_parser(&self, language: &str) -> Option<Arc<dyn CodeParser>> {
         match language.to_lowercase().as_str() {
+            "autohotkey" | "ahk" => Some(self.autohotkey.clone()),
             "bash" | "shell" | "sh" => Some(self.bash.clone()),
             "build" | "cmake" | "bats" => Some(self.build.clone()),
             "c" => Some(self.c.clone()),
@@ -266,6 +270,7 @@ impl ParserRegistry {
         }
         #[cfg_attr(not(feature = "extra-languages"), allow(unused_mut))]
         let mut parsers: Vec<Arc<dyn CodeParser>> = vec![
+            self.autohotkey.clone(),
             self.bash.clone(),
             self.build.clone(),
             self.c.clone(),
@@ -323,6 +328,7 @@ impl ParserRegistry {
     /// Get all supported file extensions.
     pub fn supported_extensions(&self) -> Vec<&str> {
         let mut extensions = Vec::new();
+        extensions.extend(self.autohotkey.file_extensions().iter().copied());
         extensions.extend(self.bash.file_extensions().iter().copied());
         extensions.extend(self.build.file_extensions().iter().copied());
         extensions.extend(self.c.file_extensions().iter().copied());
@@ -376,6 +382,7 @@ impl ParserRegistry {
     pub fn all_metrics(&self) -> Vec<(&str, ParserMetrics)> {
         #[cfg_attr(not(feature = "extra-languages"), allow(unused_mut))]
         let mut metrics: Vec<(&str, ParserMetrics)> = vec![
+            ("autohotkey", self.autohotkey.metrics()),
             ("bash", self.bash.metrics()),
             ("build", self.build.metrics()),
             ("c", self.c.metrics()),
@@ -489,6 +496,8 @@ impl ParserRegistry {
                 }
             }
             Some("c")
+        } else if self.autohotkey.can_parse(path) {
+            Some("autohotkey")
         } else if self.bash.can_parse(path) {
             Some("bash")
         } else if self.clojure.can_parse(path) {
