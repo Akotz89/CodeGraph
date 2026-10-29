@@ -617,7 +617,7 @@ impl GraphUpdater {
         }
 
         let obsolete: Vec<_> = graph.iter_edges().filter_map(|(id, edge)| {
-            matches!(edge.properties.get_string("resolved_by"), Some("sql_database_scope" | "code_sql_literal")).then_some(id)
+            matches!(edge.properties.get_string("resolved_by"), Some("sql_database_scope" | "code_sql_literal" | "code_sql_prepared")).then_some(id)
         }).collect();
         for id in obsolete {
             if let Err(error) = graph.delete_edge(id) {
@@ -654,22 +654,52 @@ impl GraphUpdater {
             tables.entry((scope.clone(), name.clone())).or_default().extend(ids);
         }
         let mut links = HashSet::new();
+        let mut prepared_links = HashSet::new();
+        let mut prepared: HashMap<(String, String), Vec<Vec<String>>> = HashMap::new();
+        let mut prepared_users = Vec::new();
         for (id, node) in graph.iter_nodes() {
             if node.node_type != codegraph::NodeType::Function { continue; }
-            let (Some(path), Some(names)) = (node.properties.get_string("path"), node.properties.get_string_list("sql_literal_tables")) else { continue; };
+            let Some(path) = node.properties.get_string("path") else { continue; };
             let root = scopes.keys().filter(|root| path.strip_prefix(root.as_str()).is_some_and(|rest| rest.starts_with('/'))).max_by_key(|root| root.len()).map(String::as_str)
                 .or_else(|| path.split_once("/src/").map(|(root, _)| root));
             let Some(root) = root else { continue; };
             let scope = match scopes.get(root) { Some(group) if !group.is_empty() => format!("group:{group}"), _ => format!("root:{root}") };
-            for name in names {
-                if let Some([table]) = tables.get(&(scope.clone(), name.clone())).map(Vec::as_slice) {
-                    links.insert((id, *table));
+            if let Some(names) = node.properties.get_string_list("sql_literal_tables") {
+                for name in names {
+                    if let Some([table]) = tables.get(&(scope.clone(), name.clone())).map(Vec::as_slice) {
+                        links.insert((id, *table));
+                    }
+                }
+            }
+            if let Some(definitions) = node.properties.get_string_list("sql_prepared_definitions") {
+                for definition in definitions {
+                    let mut fields = definition.split('\t');
+                    if let Some(key) = fields.next() {
+                        prepared.entry((scope.clone(), key.to_owned())).or_default().push(fields.map(str::to_owned).collect());
+                    }
+                }
+            }
+            if let Some(uses) = node.properties.get_string_list("sql_prepared_uses") {
+                for key in uses { prepared_users.push((id, scope.clone(), key.clone())); }
+            }
+        }
+        for (user, scope, key) in prepared_users {
+            if let Some([names]) = prepared.get(&(scope.clone(), key)).map(Vec::as_slice) {
+                for name in names {
+                    if let Some([table]) = tables.get(&(scope.clone(), name.clone())).map(Vec::as_slice) {
+                        prepared_links.insert((user, *table));
+                    }
                 }
             }
         }
-        for (function, table) in links {
-            if let Err(error) = graph.add_edge(function, table, EdgeType::References, PropertyMap::new().with("resolved_by", "code_sql_literal")) {
+        for (function, table) in &links {
+            if let Err(error) = graph.add_edge(*function, *table, EdgeType::References, PropertyMap::new().with("resolved_by", "code_sql_literal")) {
                 tracing::error!("Failed to add inferred code SQL edge: {}", error);
+            }
+        }
+        for (function, table) in prepared_links.difference(&links) {
+            if let Err(error) = graph.add_edge(*function, *table, EdgeType::References, PropertyMap::new().with("resolved_by", "code_sql_prepared")) {
+                tracing::error!("Failed to add inferred prepared SQL edge: {}", error);
             }
         }
     }
@@ -761,6 +791,24 @@ mod tests {
         super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new());
         assert!(graph.get_edges_between(function, local).unwrap().is_empty());
         assert!(graph.get_edges_between(function, foreign).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cpp_prepared_statement_users_link_to_their_sql_table() {
+        use codegraph::{CodeGraph, NodeType, PropertyMap};
+        use codegraph_parser_api::CodeParser;
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let parser = codegraph_cpp::CppParser::new();
+        parser.parse_source(r#"void define() { PrepareStatement(DEL_MAIL, "DELETE FROM mail WHERE id = ?", 0); }"#, std::path::Path::new("/repo/src/database.cpp"), &mut graph).unwrap();
+        let user = parser.parse_source(r#"void user() { auto s = db.GetPreparedStatement(DEL_MAIL); db.Execute(s); }"#, std::path::Path::new("/repo/src/user.cpp"), &mut graph).unwrap().functions[0];
+        let table = graph.add_node(NodeType::Generic, PropertyMap::new().with("name", "mail").with("kind", "table").with("path", "/repo/data/sql/base/db_characters/mail.sql")).unwrap();
+        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new());
+        assert_eq!(graph.get_edges_between(user, table).unwrap().len(), 1);
+        let edge = graph.get_edges_between(user, table).unwrap()[0];
+        assert_eq!(graph.get_edge(edge).unwrap().properties.get_string("resolved_by"), Some("code_sql_prepared"));
+        parser.parse_source(r#"void other() { PrepareStatement(DEL_MAIL, dynamic_sql, 0); }"#, std::path::Path::new("/repo/src/other.cpp"), &mut graph).unwrap();
+        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new());
+        assert!(graph.get_edges_between(user, table).unwrap().is_empty());
     }
     use super::*;
     use crate::domain::node_props;

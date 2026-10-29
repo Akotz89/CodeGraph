@@ -399,6 +399,10 @@ are retained for those links. Dynamic SQL, CTEs, qualified names, unsupported
 escapes, and ambiguous definitions are not resolved by this C++ link. Existing
 indexes must reparse C++ files to add it.
 
+Calls to `GetPreparedStatement` using a literal identifier can also link to the
+tables in a unique `PrepareStatement` definition within the same source scope.
+Conflicting definitions and dynamic identifiers remain unresolved.
+
 > **Community vs full builds:** COBOL, Fortran, Perl, Dart, Zig, and R are
 > compiled only with `--features extra-languages`. The default community binary
 > omits them — they had zero usage in telemetry and their tree-sitter grammars
