@@ -352,8 +352,20 @@ async fn handle_branch_switch(
         }
 
         // Batch update: remove old nodes + parse new + resolve imports
-        let result =
-            GraphUpdater::update_files(&ctx.graph, &ctx.parsers, &files_with_content).await;
+        let result = match GraphUpdater::update_files(&ctx.graph, &ctx.parsers, &files_with_content).await {
+            Ok(result) => result,
+            Err(error) => {
+                ctx.query_cache.invalidate_all();
+                ctx.query_engine.build_indexes().await;
+                ctx.symbol_index.rebuild_from_graph(&*ctx.graph.read().await);
+                ctx.query_engine.prune_orphan_vectors().await;
+                if !node_ids_to_invalidate.is_empty() {
+                    let _ = ctx.memory_manager.invalidate_for_code_nodes(
+                        &node_ids_to_invalidate, "Branch switch: files modified").await;
+                }
+                return Err(error.into());
+            }
+        };
 
         // Re-add to symbol index
         {
@@ -381,9 +393,19 @@ async fn handle_branch_switch(
         }
     }
 
-    // Invalidate query cache and rebuild indexes
+    // A deletion-only switch also changes which cross-file target is valid.
+    let resolution = if !deleted_files.is_empty() && modified_files.is_empty() {
+        GraphUpdater::resolve_cross_file_imports(&mut *ctx.graph.write().await)
+    } else {
+        Ok(())
+    };
+    // Keep indexes aligned with the current graph even if resolution failed.
     ctx.query_cache.invalidate_all();
     ctx.query_engine.build_indexes().await;
+    if let Err(error) = resolution {
+        ctx.query_engine.prune_orphan_vectors().await;
+        return Err(error.into());
+    }
 
     // Incrementally re-embed changed files' symbols
     for path in &modified_files {

@@ -159,13 +159,13 @@ impl CodeGraphBackend {
     async fn handle_reindex_workspace(&self) -> Result<usize> {
         tracing::info!("Reindexing workspace");
 
-        // Clear current graph and indexes
-        {
-            let mut graph = self.graph.write().await;
-            *graph = codegraph::CodeGraph::in_memory().expect("Failed to create in-memory graph");
-        }
+        // Wait for in-flight embedding before replacing node IDs.
+        self.query_engine.reset_graph_and_vectors().await;
         self.symbol_index.clear();
         self.file_cache.clear();
+        if !self.indexer.invalidate_index_state().await {
+            return Err(Error::internal_error());
+        }
 
         self.client
             .log_message(
@@ -177,10 +177,12 @@ impl CodeGraphBackend {
         // Re-index all workspace folders
         let folders = self.workspace_folders.read().await.clone();
         let mut total_indexed = 0;
+        let mut failed = 0;
 
         for folder in &folders {
-            let count = self.index_directory(folder).await;
+            let (count, errors) = self.index_directory(folder).await;
             total_indexed += count;
+            failed += errors;
             self.client
                 .log_message(
                     tower_lsp::lsp_types::MessageType::INFO,
@@ -190,10 +192,10 @@ impl CodeGraphBackend {
         }
 
         // Resolve cross-file imports after all files are indexed
-        {
+        let resolution = {
             let mut graph = self.graph.write().await;
-            GraphUpdater::resolve_cross_file_imports(&mut graph);
-        }
+            GraphUpdater::resolve_cross_file_imports(&mut graph)
+        };
 
         // Rebuild symbol index from graph (it was cleared at the start of reindex)
         {
@@ -207,7 +209,18 @@ impl CodeGraphBackend {
 
         // Rebuild AI query engine indexes
         self.query_engine.build_indexes().await;
+        self.query_engine.build_symbol_vectors().await;
+        if let Err(error) = resolution {
+            self.indexer.invalidate_index_state().await;
+            tracing::error!("Cross-file resolution failed: {error}");
+            return Err(Error::internal_error());
+        }
 
+        if failed > 0 {
+            self.indexer.invalidate_index_state().await;
+            tracing::error!("Workspace indexing failed for {failed} files");
+            return Err(Error::internal_error());
+        }
         self.client
             .log_message(
                 tower_lsp::lsp_types::MessageType::INFO,
@@ -235,6 +248,7 @@ impl CodeGraphBackend {
 
         tracing::info!("Indexing {} files", files.len());
         let mut indexed = 0usize;
+        let mut skipped = 0usize;
         let mut failed = 0usize;
 
         for path_str in &files {
@@ -244,21 +258,9 @@ impl CodeGraphBackend {
                 failed += 1;
                 continue;
             }
-            // Remove old nodes before re-parsing
-            {
-                let mut graph = self.graph.write().await;
-                if let Ok(old_nodes) = graph
-                    .query()
-                    .property("path", path.to_string_lossy().as_ref())
-                    .execute()
-                {
-                    for old_id in old_nodes {
-                        let _ = graph.delete_node(old_id);
-                    }
-                }
-            }
             match self.indexer.index_file(&self.graph, &path).await {
-                Ok(_) => indexed += 1,
+                Ok(true) => indexed += 1,
+                Ok(false) => skipped += 1,
                 Err(e) => {
                     tracing::warn!("Failed to index {:?}: {}", path, e);
                     failed += 1;
@@ -267,17 +269,23 @@ impl CodeGraphBackend {
         }
 
         // Resolve cross-file imports
-        {
+        let resolution = {
             let mut graph = self.graph.write().await;
-            GraphUpdater::resolve_cross_file_imports(&mut graph);
-        }
+            GraphUpdater::resolve_cross_file_imports(&mut graph)
+        };
         self.query_engine.build_indexes().await;
+        if let Err(error) = resolution {
+            self.indexer.invalidate_index_state().await;
+            tracing::error!("Cross-file resolution failed: {error}");
+            return Err(Error::internal_error());
+        }
 
         Ok(serde_json::json!({
-            "status": "success",
+            "status": if failed == 0 { "success" } else { "partial" },
             "files_indexed": indexed,
+            "files_skipped": skipped,
             "files_failed": failed,
-            "message": format!("Indexed {} files ({} failed)", indexed, failed)
+            "message": format!("Indexed {} files ({} unchanged, {} failed)", indexed, skipped, failed)
         }))
     }
 
@@ -300,15 +308,18 @@ impl CodeGraphBackend {
 
         tracing::info!("Indexing directories: {:?}", paths);
         let mut total_indexed = 0;
+        let mut failed = 0;
 
         for path_str in &paths {
             let path = std::path::PathBuf::from(path_str);
             if !path.is_dir() {
                 tracing::warn!("Skipping non-directory path: {}", path_str);
+                failed += 1;
                 continue;
             }
-            let count = self.index_directory(&path).await;
+            let (count, errors) = self.index_directory(&path).await;
             total_indexed += count;
+            failed += errors;
             self.client
                 .log_message(
                     tower_lsp::lsp_types::MessageType::INFO,
@@ -318,13 +329,18 @@ impl CodeGraphBackend {
         }
 
         // Resolve cross-file imports after all files are indexed
-        {
+        let resolution = {
             let mut graph = self.graph.write().await;
-            GraphUpdater::resolve_cross_file_imports(&mut graph);
-        }
+            GraphUpdater::resolve_cross_file_imports(&mut graph)
+        };
 
         // Rebuild AI query engine indexes
         self.query_engine.build_indexes().await;
+        if let Err(error) = resolution {
+            self.indexer.invalidate_index_state().await;
+            tracing::error!("Cross-file resolution failed: {error}");
+            return Err(Error::internal_error());
+        }
 
         // Start or extend file watcher for the newly indexed directories
         let indexed_paths: Vec<std::path::PathBuf> =
@@ -341,7 +357,7 @@ impl CodeGraphBackend {
             )
             .await;
 
-        Ok(serde_json::json!({ "indexed": total_indexed }))
+        Ok(serde_json::json!({ "status": if failed == 0 { "success" } else { "partial" }, "indexed": total_indexed, "failed": failed }))
     }
 
     async fn handle_update_configuration(&self, params: Value) -> Result<Value> {
@@ -365,5 +381,37 @@ impl CodeGraphBackend {
             .await;
 
         Ok(Value::Null)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use crate::ai_query::QueryEngine;
+
+    #[tokio::test]
+    async fn index_files_keeps_unchanged_nodes_and_reports_missing_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("example.py");
+        std::fs::write(&file, "def example():\n    return 1\n").unwrap();
+        let graph = Arc::new(RwLock::new(codegraph::CodeGraph::in_memory().unwrap()));
+        let engine = Arc::new(QueryEngine::new(graph.clone()));
+        let backend = CodeGraphBackend::new_for_test(graph.clone(), engine);
+        let path = file.to_string_lossy().to_string();
+        let first = backend.handle_custom_request("codegraph/indexFiles", serde_json::json!({"files": [path]})).await.unwrap();
+        assert_eq!(first["files_indexed"], 1);
+        let count = graph.read().await.node_count();
+        assert!(count > 0);
+        let second = backend.handle_custom_request("codegraph/indexFiles", serde_json::json!({"files": [path]})).await.unwrap();
+        assert_eq!(second["files_indexed"], 0);
+        assert_eq!(second["files_skipped"], 1);
+        assert_eq!(graph.read().await.node_count(), count);
+        let missing = temp.path().join("missing.py").to_string_lossy().to_string();
+        let partial = backend.handle_custom_request("codegraph/indexFiles", serde_json::json!({"files": [path, missing]})).await.unwrap();
+        assert_eq!(partial["status"], "partial");
+        assert_eq!(partial["files_failed"], 1);
+        assert_eq!(graph.read().await.node_count(), count);
     }
 }

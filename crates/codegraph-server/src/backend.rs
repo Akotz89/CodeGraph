@@ -429,11 +429,12 @@ impl CodeGraphBackend {
         // Remove stale nodes first so re-parsing doesn't leave duplicates.
         self.remove_file_from_graph(path).await;
 
+        let mut resolution_error = None;
         let parsed = {
             let mut graph = self.graph.write().await;
             match parser.parse_source(text, path, &mut graph) {
                 Ok(file_info) => {
-                    GraphUpdater::resolve_cross_file_imports(&mut graph);
+                    resolution_error = GraphUpdater::resolve_cross_file_imports(&mut graph).err();
                     self.symbol_index
                         .add_file(path.to_path_buf(), &file_info, &graph);
                     self.file_cache.insert(uri.clone(), file_info);
@@ -447,8 +448,20 @@ impl CodeGraphBackend {
         };
 
         if parsed {
-            // Refresh caller/callee/import indexes for the new node IDs.
+            // Keep the index consistent with the graph even when resolution fails.
             self.query_engine.build_indexes().await;
+            if let Some(error) = resolution_error {
+                tracing::error!("Cross-file resolution failed: {error}");
+                self.indexer.invalidate_index_state().await;
+                self.query_engine.prune_orphan_vectors().await;
+                match embed {
+                    EmbedMode::Now => self.query_engine.update_file_vectors(&path.to_string_lossy()).await,
+                    EmbedMode::Enqueue => self.embed_queue.enqueue(path.to_path_buf()),
+                    EmbedMode::Skip => {}
+                }
+                self.client.log_message(MessageType::ERROR, format!("Cross-file resolution failed: {error}")).await;
+                return false;
+            }
             match embed {
                 EmbedMode::Now => {
                     self.query_engine
@@ -572,16 +585,16 @@ impl CodeGraphBackend {
     pub fn index_directory<'a>(
         &'a self,
         dir: &'a std::path::Path,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = usize> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (usize, usize)> + Send + 'a>> {
         Box::pin(async move {
             let config = self.config.read().await.clone();
             let idx_config = Self::index_config_from_lsp(&config);
             let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let (total, _parsed, _skipped, _by_lang, _errors) = self
+            let (total, _parsed, _skipped, _by_lang, errors) = self
                 .indexer
                 .index_directory(&self.graph, dir, &idx_config, 0, counter)
                 .await;
-            total
+            (total, errors.values().sum())
         })
     }
 
@@ -1167,6 +1180,7 @@ impl LanguageServer for CodeGraphBackend {
         let config = self.config.read().await.clone();
         let mut total_indexed = 0;
         let mut files_parsed = 0usize;
+        let mut index_incomplete = false;
 
         // Try to load persisted graph from previous session (RocksDB).
         // This gives instant code intelligence without re-parsing.
@@ -1250,92 +1264,94 @@ impl LanguageServer for CodeGraphBackend {
                 .indexer
                 .index_workspace(&self.graph, &paths_to_index, &idx_config)
                 .await;
-            total_indexed = result.total_files;
-            files_parsed = result.files_parsed;
-
-            if result.files_parsed > 0 {
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!(
-                            "Incremental index: {} parsed, {} skipped (unchanged)",
-                            result.files_parsed,
-                            result.total_files - result.files_parsed
-                        ),
-                    )
-                    .await;
-
-                // Resolve cross-file imports for newly parsed files
-                {
-                    let mut graph = self.graph.write().await;
-                    GraphUpdater::resolve_cross_file_imports(&mut graph);
-                }
-            } else if loaded_from_persistence {
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!(
-                            "All {} files unchanged — using persisted graph",
-                            result.total_files
-                        ),
-                    )
-                    .await;
-            } else {
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("Indexed {} files", result.total_files),
-                    )
-                    .await;
-            }
-
-            // Rebuild the semantic/vector index. On a persisted load the
-            // vectors are read straight from disk (load_symbol_vectors), so
-            // this is only needed after a fresh parse.
-            if !loaded_from_persistence {
-                let _phase = crate::crash_phase::enter("graph_build");
+            if let Some(error) = result.failure() {
                 self.query_engine.build_indexes().await;
-                self.client
-                    .log_message(MessageType::INFO, "Semantic search index ready")
-                    .await;
-            }
+                self.symbol_index.rebuild_from_graph(&*self.graph.read().await);
+                self.client.log_message(MessageType::ERROR, format!("Indexing remains incomplete: {error}")).await;
+                index_incomplete = true;
+            } else {
+                total_indexed = result.total_files;
+                files_parsed = result.files_parsed;
 
-            // The in-memory symbol_index (position→node lookup behind hover,
-            // go-to-definition, and the graph-query fallback) is filled only
-            // while PARSING files. On a persisted-graph load the unchanged
-            // files aren't re-parsed, so rebuild it from the loaded graph —
-            // otherwise find_node_at_position returns 0 symbols and hover/goto
-            // silently break after every restart until a manual reindex.
-            if loaded_from_persistence {
-                let _phase = crate::crash_phase::enter("graph_build");
-                let graph = self.graph.read().await;
-                self.symbol_index.rebuild_from_graph(&graph);
-                tracing::info!(
-                    "Rebuilt symbol index from persisted graph ({} files)",
-                    self.symbol_index.file_count()
-                );
-            }
-
-            // Persist graph to RocksDB so next startup loads instantly
-            if result.files_parsed > 0 || result.files_removed > 0 || result.volume_metadata_changed {
-                let _phase = crate::crash_phase::enter("index_persist");
-                if let Some(first) = folders.first() {
-                    let slug = crate::memory::project_slug(first);
-                    let graph = self.graph.read().await;
-                    let persist_result = Self::persist_graph_to_rocksdb(&slug, first, &graph);
-                    drop(graph);
-                    let state_saved = self
-                        .indexer
-                        .finalize_graph_persist(persist_result.is_ok())
+                if result.files_parsed > 0 {
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!(
+                                "Incremental index: {} parsed, {} skipped (unchanged)",
+                                result.files_parsed,
+                                result.total_files - result.files_parsed
+                            ),
+                        )
                         .await;
-                    match persist_result {
-                        Err(e) => tracing::warn!("Failed to persist graph: {}", e),
-                        Ok(()) => {
-                            tracing::info!("Graph persisted to RocksDB for next session");
-                            if !state_saved {
-                                tracing::error!(
-                                    "Graph persisted, but index state could not be committed"
-                                );
+
+                } else if loaded_from_persistence {
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!(
+                                "All {} files unchanged — using persisted graph",
+                                result.total_files
+                            ),
+                        )
+                        .await;
+                } else {
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!("Indexed {} files", result.total_files),
+                        )
+                        .await;
+                }
+
+                // Rebuild the semantic/vector index. On a persisted load the
+                // vectors are read straight from disk (load_symbol_vectors), so
+                // this is only needed after a fresh parse.
+                if !loaded_from_persistence {
+                    let _phase = crate::crash_phase::enter("graph_build");
+                    self.query_engine.build_indexes().await;
+                    self.client
+                        .log_message(MessageType::INFO, "Semantic search index ready")
+                        .await;
+                }
+
+                // The in-memory symbol_index (position→node lookup behind hover,
+                // go-to-definition, and the graph-query fallback) is filled only
+                // while PARSING files. On a persisted-graph load the unchanged
+                // files aren't re-parsed, so rebuild it from the loaded graph —
+                // otherwise find_node_at_position returns 0 symbols and hover/goto
+                // silently break after every restart until a manual reindex.
+                if loaded_from_persistence {
+                    let _phase = crate::crash_phase::enter("graph_build");
+                    let graph = self.graph.read().await;
+                    self.symbol_index.rebuild_from_graph(&graph);
+                    tracing::info!(
+                        "Rebuilt symbol index from persisted graph ({} files)",
+                        self.symbol_index.file_count()
+                    );
+                }
+
+                // Persist graph to RocksDB so next startup loads instantly
+                if result.files_parsed > 0 || result.files_removed > 0 || result.volume_metadata_changed {
+                    let _phase = crate::crash_phase::enter("index_persist");
+                    if let Some(first) = folders.first() {
+                        let slug = crate::memory::project_slug(first);
+                        let graph = self.graph.read().await;
+                        let persist_result = Self::persist_graph_to_rocksdb(&slug, first, &graph);
+                        drop(graph);
+                        let state_saved = self
+                            .indexer
+                            .finalize_graph_persist(persist_result.is_ok())
+                            .await;
+                        match persist_result {
+                            Err(e) => tracing::warn!("Failed to persist graph: {}", e),
+                            Ok(()) => {
+                                tracing::info!("Graph persisted to RocksDB for next session");
+                                if !state_saved {
+                                    tracing::error!(
+                                        "Graph persisted, but index state could not be committed"
+                                    );
+                                }
                             }
                         }
                     }
@@ -1374,93 +1390,103 @@ impl LanguageServer for CodeGraphBackend {
                     if let Some(engine) = self.memory_manager().get_vector_engine().await {
                         self.query_engine.set_vector_engine(engine).await;
 
-                        let slug = crate::memory::project_slug(first_folder);
-
-                        // Always try loading persisted vectors first
-                        let load = self.query_engine.load_symbol_vectors(&slug).await;
-                        // An unreadable store says nothing about what it holds - the shared
-                        // graph.db is one RocksDB for every project, and a lock held by
-                        // another process reads exactly like this. Rebuilding with a slug
-                        // claims the project, which clears its stored vectors, so a
-                        // transient read failure used to destroy a valid set. Embed in
-                        // memory for this session and leave the store alone.
-                        let persist = !matches!(load, crate::ai_query::VectorLoad::Unreadable);
-                        if !persist {
-                            tracing::warn!(
-                                "Could not read persisted vectors for '{}'; embedding in memory \
-                                 only this session and leaving the store untouched",
-                                slug
-                            );
-                        }
-                        let loaded = load.count();
-
-                        if loaded > 0 && files_parsed == 0 {
-                            // All files unchanged — persisted vectors are current
-                            tracing::info!("Loaded {} persisted symbol vectors", loaded);
-                            self.client
-                                .log_message(
-                                    MessageType::INFO,
-                                    format!("✓ Loaded {} persisted symbol vectors", loaded),
-                                )
-                                .await;
-                            // Warm restart: still run a background verify-and-
-                            // fill — a crash-interrupted embed run leaves a
-                            // partial set that loads fine here but is missing
-                            // the tail; embed_missing_symbols no-ops
-                            // (one graph scan, no ONNX work) when complete. The
-                            // guard also resets the breadcrumb off `post_onnx`
-                            // so warm-restart sessions steady-state at `serving`.
+                        if index_incomplete {
+                            // A partial graph cannot safely reuse or persist a complete
+                            // snapshot's vectors. Build only in memory until retry.
+                            self.query_engine.clear_symbol_vectors().await;
                             let query_engine = Arc::clone(&self.query_engine);
-                            let slug_bg = slug.clone();
                             tokio::spawn(async move {
-                                let _phase = crate::crash_phase::enter("index_embed");
-                                query_engine
-                                    .embed_missing_symbols_checkpointed(Some(&slug_bg))
-                                    .await;
-                                if let Err(e) = query_engine.save_symbol_vectors(&slug_bg).await {
-                                    tracing::warn!("Failed to persist symbol vectors: {}", e);
-                                }
+                                query_engine.build_symbol_vectors().await;
                             });
                         } else {
-                            // Embeddings need building — do it in background.
-                            // Checkpointed: periodic vector saves + RAM
-                            // backpressure so an OOM-kill mid-marathon loses
-                            // minutes, not the run (telemetry: linux SIGKILL
-                            // ~25 min into big first indexes).
-                            let query_engine = Arc::clone(&self.query_engine);
-                            let slug_bg = slug.clone();
-                            let had_vectors = loaded > 0;
-                            tracing::info!("Starting background embedding generation...");
-                            self.client
-                                .log_message(
-                                    MessageType::INFO,
-                                    "Building embeddings in background — tools available immediately",
-                                )
-                                .await;
-                            tokio::spawn(async move {
-                                // Embedding runs native ONNX over symbol bodies —
-                                // the other suspect for the win32 0xC0000005
-                                // crashes. Guard resets to `serving` on finish.
-                                let _phase = crate::crash_phase::enter("index_embed");
-                                if had_vectors {
+                            let slug = crate::memory::project_slug(first_folder);
+
+                            // Always try loading persisted vectors first
+                            let load = self.query_engine.load_symbol_vectors(&slug).await;
+                            // An unreadable store says nothing about what it holds - the shared
+                            // graph.db is one RocksDB for every project, and a lock held by
+                            // another process reads exactly like this. Rebuilding with a slug
+                            // claims the project, which clears its stored vectors, so a
+                            // transient read failure used to destroy a valid set. Embed in
+                            // memory for this session and leave the store alone.
+                            let persist = !matches!(load, crate::ai_query::VectorLoad::Unreadable);
+                            if !persist {
+                                tracing::warn!(
+                                    "Could not read persisted vectors for '{}'; embedding in memory \
+                                     only this session and leaving the store untouched",
+                                    slug
+                                );
+                            }
+                            let loaded = load.count();
+
+                            if loaded > 0 && files_parsed == 0 {
+                                // All files unchanged — persisted vectors are current
+                                tracing::info!("Loaded {} persisted symbol vectors", loaded);
+                                self.client
+                                    .log_message(
+                                        MessageType::INFO,
+                                        format!("✓ Loaded {} persisted symbol vectors", loaded),
+                                    )
+                                    .await;
+                                // Warm restart: still run a background verify-and-
+                                // fill — a crash-interrupted embed run leaves a
+                                // partial set that loads fine here but is missing
+                                // the tail; embed_missing_symbols no-ops
+                                // (one graph scan, no ONNX work) when complete. The
+                                // guard also resets the breadcrumb off `post_onnx`
+                                // so warm-restart sessions steady-state at `serving`.
+                                let query_engine = Arc::clone(&self.query_engine);
+                                let slug_bg = slug.clone();
+                                tokio::spawn(async move {
+                                    let _phase = crate::crash_phase::enter("index_embed");
                                     query_engine
                                         .embed_missing_symbols_checkpointed(Some(&slug_bg))
                                         .await;
-                                } else {
-                                    query_engine
-                                        .build_symbol_vectors_checkpointed(
-                                            persist.then_some(slug_bg.as_str()),
-                                        )
-                                        .await;
-                                }
-                                if persist {
-                                    if let Err(e) = query_engine.save_symbol_vectors(&slug_bg).await
-                                    {
+                                    if let Err(e) = query_engine.save_symbol_vectors(&slug_bg).await {
                                         tracing::warn!("Failed to persist symbol vectors: {}", e);
                                     }
-                                }
-                                tracing::info!("Background embedding generation complete");
-                            });
+                                });
+                            } else {
+                                // Embeddings need building — do it in background.
+                                // Checkpointed: periodic vector saves + RAM
+                                // backpressure so an OOM-kill mid-marathon loses
+                                // minutes, not the run (telemetry: linux SIGKILL
+                                // ~25 min into big first indexes).
+                                let query_engine = Arc::clone(&self.query_engine);
+                                let slug_bg = slug.clone();
+                                let had_vectors = loaded > 0;
+                                tracing::info!("Starting background embedding generation...");
+                                self.client
+                                    .log_message(
+                                        MessageType::INFO,
+                                        "Building embeddings in background — tools available immediately",
+                                    )
+                                    .await;
+                                tokio::spawn(async move {
+                                    // Embedding runs native ONNX over symbol bodies —
+                                    // the other suspect for the win32 0xC0000005
+                                    // crashes. Guard resets to `serving` on finish.
+                                    let _phase = crate::crash_phase::enter("index_embed");
+                                    if had_vectors {
+                                        query_engine
+                                            .embed_missing_symbols_checkpointed(Some(&slug_bg))
+                                            .await;
+                                    } else {
+                                        query_engine
+                                            .build_symbol_vectors_checkpointed(
+                                                persist.then_some(slug_bg.as_str()),
+                                            )
+                                            .await;
+                                    }
+                                    if persist {
+                                        if let Err(e) = query_engine.save_symbol_vectors(&slug_bg).await
+                                        {
+                                            tracing::warn!("Failed to persist symbol vectors: {}", e);
+                                        }
+                                    }
+                                    tracing::info!("Background embedding generation complete");
+                                });
+                            }
                         }
                     }
                 }
@@ -2005,11 +2031,8 @@ impl LanguageServer for CodeGraphBackend {
             }
 
             "codegraph.reindexWorkspace" => {
-                // Clear graph and caches
-                {
-                    let mut graph = self.graph.write().await;
-                    *graph = CodeGraph::in_memory().expect("Failed to create graph");
-                }
+                // Wait for in-flight embedding before replacing node IDs.
+                self.query_engine.reset_graph_and_vectors().await;
                 self.symbol_index.clear();
                 self.file_cache.clear();
                 self.query_cache.invalidate_all();
@@ -2043,6 +2066,13 @@ impl LanguageServer for CodeGraphBackend {
                     .index_workspace(&self.graph, &paths_to_index, &idx_config)
                     .await;
                 let duration_ms = started_at.elapsed().as_millis() as u64;
+                if let Some(error) = result.failure() {
+                    self.query_engine.build_indexes().await;
+                    self.symbol_index.rebuild_from_graph(&*self.graph.read().await);
+                    self.query_engine.build_symbol_vectors().await;
+                    tracing::error!("Indexing failed: {error}");
+                    return Err(tower_lsp::jsonrpc::Error::internal_error());
+                }
 
                 let total_indexed = result.total_files;
 
@@ -2455,43 +2485,38 @@ impl LanguageServer for CodeGraphBackend {
                     .collect();
 
                 let mut indexed = 0usize;
+                let mut skipped = 0usize;
                 let mut failed = 0usize;
                 for path in &files {
                     if !path.exists() {
                         failed += 1;
                         continue;
                     }
-                    // Remove old nodes before re-parsing
-                    {
-                        let mut graph = self.graph.write().await;
-                        let path_str = path.to_string_lossy().to_string();
-                        if let Ok(old_nodes) =
-                            graph.query().property("path", path_str.as_str()).execute()
-                        {
-                            for old_id in old_nodes {
-                                let _ = graph.delete_node(old_id);
-                            }
-                        }
-                    }
                     match self.indexer.index_file(&self.graph, path).await {
                         Ok(true) => indexed += 1,
-                        Ok(false) => {} // unchanged
+                        Ok(false) => skipped += 1, // unchanged
                         Err(_) => failed += 1,
                     }
                 }
 
-                if indexed > 0 {
+                if indexed > 0 || failed > 0 {
                     // Resolve cross-file imports and rebuild indexes
-                    {
+                    let resolution = {
                         let mut graph = self.graph.write().await;
-                        crate::watcher::GraphUpdater::resolve_cross_file_imports(&mut graph);
-                    }
+                        crate::watcher::GraphUpdater::resolve_cross_file_imports(&mut graph)
+                    };
                     self.query_engine.build_indexes().await;
+                    if let Err(error) = resolution {
+                        self.indexer.invalidate_index_state().await;
+                        tracing::error!("Cross-file resolution failed: {error}");
+                        return Err(tower_lsp::jsonrpc::Error::internal_error());
+                    }
                 }
 
                 Ok(Some(serde_json::json!({
                     "status": if failed == 0 { "success" } else { "partial" },
                     "files_indexed": indexed,
+                    "files_skipped": skipped,
                     "files_failed": failed,
                     "message": format!("Indexed {} files ({} failed)", indexed, failed)
                 })))
@@ -2517,25 +2542,36 @@ impl LanguageServer for CodeGraphBackend {
                 let lsp_config = self.config.read().await.clone();
                 let config = Self::index_config_from_lsp(&lsp_config);
                 let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let (total, _parsed, _skipped, _by_lang, _errors) = self
+                let (total, _parsed, _skipped, _by_lang, errors) = self
                     .indexer
                     .index_directory(&self.graph, &dir, &config, 0, counter)
                     .await;
+                let failed: usize = errors.values().sum();
 
-                if total > 0 {
-                    {
+                if total > 0 || failed > 0 {
+                    let resolution = {
                         let mut graph = self.graph.write().await;
-                        crate::watcher::GraphUpdater::resolve_cross_file_imports(&mut graph);
-                    }
+                        crate::watcher::GraphUpdater::resolve_cross_file_imports(&mut graph)
+                    };
                     self.query_engine.build_indexes().await;
+                    if let Err(error) = resolution {
+                        self.indexer.invalidate_index_state().await;
+                        tracing::error!("Cross-file resolution failed: {error}");
+                        return Err(tower_lsp::jsonrpc::Error::internal_error());
+                    }
+                    if failed > 0 {
+                        self.query_engine.prune_orphan_vectors().await;
+                        self.indexer.invalidate_index_state().await;
+                    }
                     if embed {
                         self.query_engine.build_symbol_vectors().await;
                     }
                 }
 
                 Ok(Some(serde_json::json!({
-                    "status": "success",
+                    "status": if failed == 0 { "success" } else { "partial" },
                     "files_indexed": total,
+                    "files_failed": failed,
                     "directory": path,
                     "embedded": embed,
                     "message": format!("Added {} files from {}{}", total, path,
