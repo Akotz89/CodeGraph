@@ -1485,6 +1485,30 @@ mod tests {
         assert!(hashes.get_hash(&other_header).is_none());
     }
 
+    #[tokio::test]
+    async fn indexes_python_stubs_and_commonjs_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let stub = root.join("api.pyi");
+        let commonjs = root.join("app.cjs");
+        std::fs::write(&stub, "def fetch_player() -> int: ...\n").unwrap();
+        std::fs::write(&commonjs, "function fetchPlayer() { return 1; }\nmodule.exports = fetchPlayer;\n").unwrap();
+        let parsers = Arc::new(ParserRegistry::new());
+        let state = Arc::new(Mutex::new(IndexState::for_workspace("extra-source-formats-test", &root)));
+        let indexer = Indexer::new(parsers.clone(), state.clone());
+        let mut config = IndexConfig::default();
+        config.explicit_source_extensions = parsers.supported_extensions().iter().map(|s| s.trim_start_matches('.').to_string()).collect();
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        indexer.index_workspace(&graph, std::slice::from_ref(&root), &config).await;
+        let hashes = state.lock().await;
+        assert!(hashes.get_hash(&stub).is_some());
+        assert!(hashes.get_hash(&commonjs).is_some());
+        drop(hashes);
+        let g = graph.read().await;
+        assert!(g.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("fetch_player")));
+        assert!(g.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("fetchPlayer")));
+    }
+
     #[test]
     fn workspace_filter_reads_codegraphignore_per_root() {
         let tmp = tempfile::tempdir().unwrap();

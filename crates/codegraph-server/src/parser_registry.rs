@@ -550,7 +550,7 @@ impl ParserRegistry {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                 match ext {
                     "ts" | "tsx" => Some("typescript"),
-                    "js" | "jsx" => Some("javascript"),
+                    "js" | "jsx" | "cjs" => Some("javascript"),
                     _ => Some("typescript"),
                 }
             } else {
@@ -1000,6 +1000,8 @@ mod tests {
             registry.language_for_path(&PathBuf::from("test.jsx")),
             Some("javascript")
         );
+        assert_eq!(registry.language_for_path(&PathBuf::from("test.cjs")), Some("javascript"));
+        assert_eq!(registry.language_for_path(&PathBuf::from("test.pyi")), Some("python"));
         assert_eq!(
             registry.language_for_path(&PathBuf::from("test.sv")),
             Some("verilog")
