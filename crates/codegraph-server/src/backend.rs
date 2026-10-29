@@ -421,6 +421,10 @@ impl CodeGraphBackend {
         text: &str,
         embed: EmbedMode,
     ) -> bool {
+        if let Err(error) = crate::watcher::validate_call_scope_configuration() {
+            self.client.log_message(MessageType::ERROR, format!("Cannot index source: {error}")).await;
+            return false;
+        }
         let Some(parser) = self.parsers.parser_for_path(path) else {
             tracing::warn!("No parser found for: {:?}", path);
             return false;
@@ -1983,6 +1987,10 @@ impl LanguageServer for CodeGraphBackend {
         } else {
             params.command.clone()
         };
+
+        if matches!(canonical_command.as_str(), "codegraph.reindexWorkspace" | "codegraph.indexFiles" | "codegraph.indexDirectory") {
+            crate::watcher::validate_call_scope_configuration().map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        }
 
         match canonical_command.as_str() {
             "codegraph.getDependencyGraph" => {

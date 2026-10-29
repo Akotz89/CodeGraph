@@ -1127,6 +1127,10 @@ impl Indexer {
         let _phase = crate::crash_phase::enter("index_parse");
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut result = IndexResult::default();
+        if let Err(error) = crate::watcher::validate_call_scope_configuration() {
+            result.resolution_error = Some(error.to_string());
+            return result;
+        }
         self.refresh_mount_snapshot();
 
         for folder in folders {
@@ -1532,6 +1536,7 @@ impl Indexer {
         graph: &Arc<RwLock<CodeGraph>>,
         path: &Path,
     ) -> Result<bool, String> {
+        crate::watcher::validate_call_scope_configuration().map_err(|error| error.to_string())?;
         // Read content and compute hash. SQL has a parser-specific larger
         // bound, enforced before allocating the full contents.
         let content = read_index_content(path)?;

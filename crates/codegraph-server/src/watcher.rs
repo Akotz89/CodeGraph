@@ -207,6 +207,7 @@ impl FileWatcher {
         embed_queue: &EmbedQueue,
         path: &Path,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        validate_call_scope_configuration()?;
         // Skip non-parseable files
         let parser = match parsers.parser_for_path(path) {
             Some(p) => p,
@@ -267,6 +268,7 @@ impl FileWatcher {
         embed_queue: &EmbedQueue,
         path: &Path,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        validate_call_scope_configuration()?;
         let path_str = path.to_string_lossy().to_string();
         let node_id_strings: Vec<String>;
         let resolution;
@@ -342,6 +344,7 @@ impl GraphUpdater {
         parsers: &Arc<ParserRegistry>,
         files: &[(PathBuf, String)],
     ) -> codegraph::Result<BatchUpdateResult> {
+        validate_call_scope_configuration()?;
         let mut succeeded = Vec::new();
         let mut failed = Vec::new();
 
@@ -382,6 +385,14 @@ impl GraphUpdater {
     /// This should be called after any parse operation to ensure cross-file
     /// imports are properly resolved.
     pub fn resolve_cross_file_imports(graph: &mut CodeGraph) -> codegraph::Result<()> {
+        let scopes = configured_call_scopes()?;
+        Self::resolve_cross_file_imports_with_scopes(graph, &scopes)
+    }
+
+    fn resolve_cross_file_imports_with_scopes(
+        graph: &mut CodeGraph,
+        call_scopes: &std::collections::HashMap<String, String>,
+    ) -> codegraph::Result<()> {
         use codegraph::{EdgeType, NodeType, PropertyMap};
 
         // All nodes come from the in-memory graph iterator, avoiding silent
@@ -440,6 +451,39 @@ impl GraphUpdater {
             }
         }
 
+        // A C-family call cannot bind directly to an unrelated Python/Rust
+        // symbol merely because it has a higher complexity score. When there
+        // is exactly one C-family function and no same-named C-family type,
+        // prefer it over a non-C-family global winner. Keep the existing
+        // resolver for ambiguous C-family names and possible FFI calls.
+        let mut c_family_functions: std::collections::HashMap<String, Option<codegraph::NodeId>> = std::collections::HashMap::new();
+        let mut c_family_types = HashSet::new();
+        let mut scoped_functions: HashMap<(String, String), Option<codegraph::NodeId>> = HashMap::new();
+        let mut scoped_types = HashSet::new();
+        for (id, node) in graph.iter_nodes() {
+            if !is_c_family_node(node) { continue; }
+            let Some(name) = node.properties.get_string("name") else { continue; };
+            let scope = node.properties.get_string("path")
+                .and_then(|path| call_scope_for_path(path, call_scopes));
+            if let Some(scope) = scope {
+                let key = (scope.to_string(), name.to_string());
+                match node.node_type {
+                    NodeType::Function => { scoped_functions.entry(key).and_modify(|candidate| *candidate = None).or_insert(Some(id)); }
+                    NodeType::Class | NodeType::Interface => { scoped_types.insert(key); }
+                    _ => {}
+                }
+            }
+            match node.node_type {
+                NodeType::Function => {
+                    c_family_functions.entry(name.to_string())
+                        .and_modify(|candidate| *candidate = None)
+                        .or_insert(Some(id));
+                }
+                NodeType::Class | NodeType::Interface => { c_family_types.insert(name.to_string()); }
+                _ => {}
+            }
+        }
+
         // Remove only inferred calls whose selected target has changed. Keep
         // parser-authored calls and avoid rewriting unchanged edges on rescans.
         let desired_calls: HashSet<_> = graph.iter_nodes()
@@ -448,7 +492,23 @@ impl GraphUpdater {
                 node.properties.get_string_list_compat("unresolved_calls")
                     .unwrap_or_default().into_iter()
                     .filter(|name| !name.is_empty())
-                    .filter_map(|name| symbol_map.get(name.as_str()).copied().map(|target| (id, target)))
+                    .filter_map(|name| {
+                        let target = symbol_map.get(name.as_str()).copied()?;
+                        let caller_is_c = is_c_family_node(node);
+                        if caller_is_c {
+                            if let Some(scope) = node.properties.get_string("path").and_then(|path| call_scope_for_path(path, call_scopes)) {
+                                let key = (scope.to_string(), name.clone());
+                                if !scoped_types.contains(&key) {
+                                    if let Some(Some(scoped)) = scoped_functions.get(&key) { return Some((id, *scoped)); }
+                                }
+                            }
+                        }
+                        let target_is_c = graph.get_node(target).ok().is_some_and(is_c_family_node);
+                        if caller_is_c && !target_is_c && !c_family_types.contains(&name) {
+                            if let Some(Some(local)) = c_family_functions.get(&name) { return Some((id, *local)); }
+                        }
+                        Some((id, target))
+                    })
                     .collect::<Vec<_>>()
             }).collect();
         let obsolete_calls: Vec<_> = graph.iter_edges().filter_map(|(id, edge)| {
@@ -653,6 +713,62 @@ impl GraphUpdater {
         });
         (obsolete, additions)
     }
+}
+
+pub fn validate_call_scope_configuration() -> codegraph::Result<()> {
+    configured_call_scopes().map(|_| ())
+}
+
+fn configured_call_scopes() -> codegraph::Result<HashMap<String, String>> {
+    match std::env::var("CODEGRAPH_CALL_SCOPE_MAP") {
+        Ok(raw) => parse_call_scope_map(&raw),
+        Err(std::env::VarError::NotPresent) => Ok(HashMap::new()),
+        Err(_) => Err(codegraph::GraphError::InvalidOperation {
+            message: "CODEGRAPH_CALL_SCOPE_MAP is not valid Unicode".to_string(),
+        }),
+    }
+}
+
+fn parse_call_scope_map(raw: &str) -> codegraph::Result<HashMap<String, String>> {
+    let parsed: HashMap<String, String> = serde_json::from_str(raw).map_err(|error|
+        codegraph::GraphError::InvalidOperation { message: format!("Invalid CODEGRAPH_CALL_SCOPE_MAP: {error}") })?;
+    let mut scopes = HashMap::new();
+    for (root, group) in parsed {
+        let path = Path::new(&root);
+        if !path.is_absolute() || group.trim().is_empty() || path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            return Err(codegraph::GraphError::InvalidOperation {
+                message: "CODEGRAPH_CALL_SCOPE_MAP requires absolute roots without parent components and nonempty groups".to_string(),
+            });
+        }
+        let normalized: PathBuf = path.components().collect();
+        let normalized = normalized.to_str().ok_or_else(|| codegraph::GraphError::InvalidOperation {
+            message: "CODEGRAPH_CALL_SCOPE_MAP contains a non-Unicode root".to_string(),
+        })?.to_string();
+        if scopes.insert(normalized, group).is_some() {
+            return Err(codegraph::GraphError::InvalidOperation {
+                message: "CODEGRAPH_CALL_SCOPE_MAP contains duplicate normalized roots".to_string(),
+            });
+        }
+    }
+    Ok(scopes)
+}
+
+fn call_scope_for_path<'a>(path: &str, scopes: &'a HashMap<String, String>) -> Option<&'a str> {
+    scopes.iter()
+        .filter(|(root, _)| Path::new(path).strip_prefix(Path::new(root)).is_ok())
+        .max_by_key(|(root, _)| Path::new(root).components().count())
+        .map(|(_, group)| group.as_str())
+}
+
+fn is_c_family_node(node: &codegraph::Node) -> bool {
+    if let Some(language) = node.properties.get_string("language") {
+        return matches!(language.to_ascii_lowercase().as_str(), "c" | "cpp" | "c++");
+    }
+    let Some(path) = node.properties.get_string("path") else { return false; };
+    let path = path.to_ascii_lowercase();
+    path.ends_with(".cpp.inc") || path.ends_with(".h.in") ||
+        std::path::Path::new(&path).extension().and_then(|ext| ext.to_str())
+            .is_some_and(|ext| matches!(ext, "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx"))
 }
 
 /// Weight a symbol for deduplication: prefer non-stub implementations.
@@ -1783,6 +1899,166 @@ void helper_func(int x) {
             has_calls_edge(&graph, main_id_new, helper_id_final.unwrap()),
             "Expected Calls edge main_func -> helper_func after did_open cycle"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_scope_config_rejects_library_update_before_mutation() {
+        const MARKER: &str = "CODEGRAPH_TEST_INVALID_SCOPE_CHILD";
+        if std::env::var_os(MARKER).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "watcher::tests::invalid_scope_config_rejects_library_update_before_mutation"])
+                .env(MARKER, "1").env("CODEGRAPH_CALL_SCOPE_MAP", "invalid-json")
+                .output().unwrap();
+            assert!(result.status.success(), "child failed: {}", String::from_utf8_lossy(&result.stderr));
+            return;
+        }
+        use codegraph::{NodeType, PropertyMap};
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        let path = PathBuf::from("/test/unchanged.cpp");
+        let id = graph.write().await.add_node(NodeType::Function, PropertyMap::new()
+            .with("name", "original").with("path", path.to_string_lossy().to_string())).unwrap();
+        let parsers = Arc::new(ParserRegistry::new());
+        assert!(GraphUpdater::update_files(&graph, &parsers, &[(path, "void replacement() {}".into())]).await.is_err());
+        let g = graph.read().await;
+        assert_eq!(g.get_node(id).unwrap().properties.get_string("name"), Some("original"));
+        assert_eq!(g.node_count(), 1);
+    }
+
+    #[test]
+    fn call_scope_configuration_rejects_malformed_or_unsafe_roots() {
+        assert!(parse_call_scope_map("not-json").is_err());
+        assert!(parse_call_scope_map(r#"{"relative":"group"}"#).is_err());
+        assert!(parse_call_scope_map(r#"{"/repo":""}"#).is_err());
+        assert!(parse_call_scope_map(r#"{"/repo":"a","/repo/":"b"}"#).is_err());
+        assert!(parse_call_scope_map(r#"{"/repo/../other":"a"}"#).is_err());
+        let scopes = parse_call_scope_map(r#"{"/":"all","/repo/":"project"}"#).unwrap();
+        assert_eq!(call_scope_for_path("/repo/src/file.cpp", &scopes), Some("project"));
+        assert_eq!(call_scope_for_path("/repo-other/file.cpp", &scopes), Some("all"));
+    }
+
+    #[test]
+    fn parsed_cpp_scope_keeps_module_calls_on_their_source_copy() {
+        use codegraph_parser_api::CodeParser;
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let parser = codegraph_cpp::CppParser::new();
+        let caller = parser.parse_source("int module_caller() { return GameTime::GetGameTime(); }", Path::new("/repo/module/src/caller.cpp"), &mut graph).unwrap().functions[0];
+        let candidate = parser.parse_source("namespace GameTime { int GetGameTime() { return 1; } }", Path::new("/repo/candidate/src/time.cpp"), &mut graph).unwrap().functions[0];
+        let old = parser.parse_source("namespace GameTime { int GetGameTime() { if (true) { return 2; } return 0; } }", Path::new("/repo/old/src/time.cpp"), &mut graph).unwrap().functions[0];
+        let scopes = HashMap::from([
+            ("/repo/module".to_string(), "candidate".to_string()),
+            ("/repo/candidate".to_string(), "candidate".to_string()),
+            ("/repo/old".to_string(), "old".to_string()),
+        ]);
+        GraphUpdater::resolve_cross_file_imports_with_scopes(&mut graph, &scopes).unwrap();
+        assert!(has_calls_edge(&graph, caller, candidate));
+        assert!(!has_calls_edge(&graph, caller, old));
+    }
+
+    #[test]
+    fn configured_source_scopes_separate_duplicate_cpp_definitions() {
+        use codegraph::{NodeType, PropertyMap};
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let caller = graph.add_node(NodeType::Function, PropertyMap::new().with("name", "caller")
+            .with("path", "/repo/candidate/src/caller.cpp")
+            .with("unresolved_calls", vec!["GameTime::GetGameTime".to_string()])).unwrap();
+        let target = graph.add_node(NodeType::Function, PropertyMap::new().with("name", "GameTime::GetGameTime")
+            .with("path", "/repo/candidate/src/time.cpp").with("complexity", 1_i64)).unwrap();
+        let fixture = graph.add_node(NodeType::Function, PropertyMap::new().with("name", "GameTime::GetGameTime")
+            .with("path", "/repo/fixtures/time.cpp").with("complexity", 99_i64)).unwrap();
+        let scopes = HashMap::from([
+            ("/repo".to_string(), "other".to_string()),
+            ("/repo/candidate".to_string(), "candidate".to_string()),
+            ("/repo/fixtures".to_string(), "fixtures".to_string()),
+        ]);
+        GraphUpdater::resolve_cross_file_imports_with_scopes(&mut graph, &scopes).unwrap();
+        assert!(has_calls_edge(&graph, caller, target));
+        assert!(!has_calls_edge(&graph, caller, fixture));
+        assert_eq!(call_scope_for_path("/repo/candidate-old/a.cpp", &scopes), Some("other"));
+    }
+
+    #[test]
+    fn parsed_cpp_call_prefers_cpp_definition_over_unrelated_python() {
+        use codegraph_parser_api::CodeParser;
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let cpp = codegraph_cpp::CppParser::new();
+        let python = codegraph_python::PythonParser::new();
+        let caller = cpp.parse_source("void caller() { helper(); }", Path::new("/repo/src/caller.cpp"), &mut graph).unwrap().functions[0];
+        let target = cpp.parse_source("void helper() {}", Path::new("/repo/src/helper.cpp"), &mut graph).unwrap().functions[0];
+        let foreign = python.parse_source("def helper():\n    if True:\n        if True:\n            return 1\n    return 0\n", Path::new("/repo/tests/helper.py"), &mut graph).unwrap().functions[0];
+        GraphUpdater::resolve_cross_file_imports(&mut graph).unwrap();
+        assert!(has_calls_edge(&graph, caller, target));
+        assert!(!has_calls_edge(&graph, caller, foreign));
+    }
+
+    #[test]
+    fn cpp_call_does_not_choose_a_same_named_python_function() {
+        use codegraph::{NodeType, PropertyMap};
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let caller = graph.add_node(NodeType::Function, PropertyMap::new()
+            .with("name", "caller").with("path", "/repo/src/caller.cpp")
+            .with("unresolved_calls", vec!["helper".to_string()])).unwrap();
+        let cpp = graph.add_node(NodeType::Function, PropertyMap::new()
+            .with("name", "helper").with("path", "/repo/src/helper.cpp")
+            .with("complexity", 1_i64)).unwrap();
+        let python = graph.add_node(NodeType::Function, PropertyMap::new()
+            .with("name", "helper").with("path", "/repo/tests/helper.py")
+            .with("complexity", 99_i64)).unwrap();
+        GraphUpdater::resolve_cross_file_imports(&mut graph).unwrap();
+        assert!(has_calls_edge(&graph, caller, cpp));
+        assert!(!has_calls_edge(&graph, caller, python));
+    }
+
+    #[test]
+    fn cpp_cross_language_call_remains_when_no_c_family_candidate_exists() {
+        use codegraph::{NodeType, PropertyMap};
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let caller = graph.add_node(NodeType::Function, PropertyMap::new()
+            .with("name", "caller").with("path", "/repo/caller.cpp")
+            .with("unresolved_calls", vec!["foreign".to_string()])).unwrap();
+        let foreign = graph.add_node(NodeType::Function, PropertyMap::new()
+            .with("name", "foreign").with("path", "/repo/ffi.rs")).unwrap();
+        GraphUpdater::resolve_cross_file_imports(&mut graph).unwrap();
+        assert!(has_calls_edge(&graph, caller, foreign));
+    }
+
+    #[test]
+    fn c_family_detection_honors_language_and_template_paths() {
+        use codegraph::{Node, NodeType, PropertyMap};
+        let node = |props| Node::new(1, NodeType::Function, props);
+        assert!(!is_c_family_node(&node(PropertyMap::new().with("language", "python").with("path", "/repo/f.cpp"))));
+        assert!(is_c_family_node(&node(PropertyMap::new().with("language", "cpp").with("path", "/repo/template.unknown"))));
+        assert!(is_c_family_node(&node(PropertyMap::new().with("path", "/repo/unit.cpp.inc"))));
+        assert!(is_c_family_node(&node(PropertyMap::new().with("path", "/repo/build.h.in"))));
+    }
+
+    #[test]
+    fn c_caller_prefers_unique_family_function_using_language_metadata() {
+        use codegraph::{NodeType, PropertyMap};
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let caller = graph.add_node(NodeType::Function, PropertyMap::new()
+            .with("name", "caller").with("language", "c").with("path", "/repo/caller.py")
+            .with("unresolved_calls", vec!["helper".to_string()])).unwrap();
+        let c_target = graph.add_node(NodeType::Function, PropertyMap::new()
+            .with("name", "helper").with("language", "cpp").with("path", "/repo/helper.py")).unwrap();
+        let foreign = graph.add_node(NodeType::Function, PropertyMap::new()
+            .with("name", "helper").with("language", "python").with("path", "/repo/helper.cpp")
+            .with("complexity", 99_i64)).unwrap();
+        GraphUpdater::resolve_cross_file_imports(&mut graph).unwrap();
+        assert!(has_calls_edge(&graph, caller, c_target));
+        assert!(!has_calls_edge(&graph, caller, foreign));
+    }
+
+    #[test]
+    fn c_family_class_remains_constructor_candidate() {
+        use codegraph::{NodeType, PropertyMap};
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let caller = graph.add_node(NodeType::Function, PropertyMap::new()
+            .with("name", "caller").with("path", "/repo/caller.cpp")
+            .with("unresolved_calls", vec!["Widget".to_string()])).unwrap();
+        graph.add_node(NodeType::Function, PropertyMap::new().with("name", "Widget").with("path", "/repo/widget.cpp")).unwrap();
+        let class = graph.add_node(NodeType::Class, PropertyMap::new().with("name", "Widget").with("path", "/repo/widget.hpp")).unwrap();
+        GraphUpdater::resolve_cross_file_imports(&mut graph).unwrap();
+        assert!(has_calls_edge(&graph, caller, class));
     }
 
     #[test]

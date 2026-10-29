@@ -157,6 +157,7 @@ impl CodeGraphBackend {
 
     /// Handle reindex workspace request
     async fn handle_reindex_workspace(&self) -> Result<usize> {
+        crate::watcher::validate_call_scope_configuration().map_err(|_| Error::internal_error())?;
         tracing::info!("Reindexing workspace");
 
         // Wait for in-flight embedding before replacing node IDs.
@@ -232,6 +233,7 @@ impl CodeGraphBackend {
     }
 
     async fn handle_index_files(&self, params: Value) -> Result<Value> {
+        crate::watcher::validate_call_scope_configuration().map_err(|_| Error::internal_error())?;
         self.indexer.refresh_mount_snapshot();
         // Accept both "files" (VS Code LM tools) and "paths" (MCP convention)
         let files: Vec<String> = params
@@ -290,6 +292,7 @@ impl CodeGraphBackend {
     }
 
     async fn handle_index_directory(&self, params: Value) -> Result<Value> {
+        crate::watcher::validate_call_scope_configuration().map_err(|_| Error::internal_error())?;
         // Accept "path" (singular string) or "paths" (array)
         let paths: Vec<String> = if let Some(path) = params.get("path").and_then(|v| v.as_str()) {
             vec![path.to_string()]

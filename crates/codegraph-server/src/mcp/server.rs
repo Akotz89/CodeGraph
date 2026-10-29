@@ -1204,6 +1204,7 @@ impl McpBackend {
     /// Also detects and re-indexes direct dependents (files that called or
     /// imported symbols from the updated files) to keep edges consistent.
     pub async fn add_files_to_index(&self, paths: &[PathBuf]) -> Result<(usize, usize), String> {
+        crate::watcher::validate_call_scope_configuration().map_err(|error| error.to_string())?;
         let _guard = self.indexer.mcp_operation_lock.lock().await;
         if self.forced_reindex_incomplete.load(std::sync::atomic::Ordering::Acquire) {
             return Err("Workspace reindex is incomplete; retry a forced reindex".to_string());
@@ -1366,6 +1367,7 @@ impl McpBackend {
         dir: &std::path::Path,
         embed: bool,
     ) -> Result<usize, String> {
+        crate::watcher::validate_call_scope_configuration().map_err(|error| error.to_string())?;
         let _guard = self.indexer.mcp_operation_lock.lock().await;
         if self.forced_reindex_incomplete.load(std::sync::atomic::Ordering::Acquire) {
             return Err("Workspace reindex is incomplete; retry a forced reindex".to_string());
@@ -3730,6 +3732,7 @@ impl McpServer {
 
             // ==================== Admin Tools ====================
             "codegraph_reindex_workspace" => {
+                crate::watcher::validate_call_scope_configuration().map_err(|error| error.to_string())?;
                 let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
                 let _reindex_guard = self.backend.reindex_lock.lock().await;
                 let _operation_guard = self.backend.indexer.mcp_operation_lock.lock().await;

@@ -641,6 +641,10 @@ fn path_key(path: &Path) -> String {
 /// Process accumulated file changes: re-index changed files, remove deleted files.
 async fn process_changes(ctx: &WatcherCtx, changed: &[PathBuf], removed: &[PathBuf]) {
     let _guard = ctx.indexer.mcp_operation_lock.lock().await;
+    if let Err(error) = crate::watcher::validate_call_scope_configuration() {
+        tracing::error!("Cannot update graph: {error}");
+        return;
+    }
     if ctx.indexer.mcp_reindex_incomplete.load(std::sync::atomic::Ordering::Acquire) {
         tracing::warn!("Skipping watcher batch while forced reindex is incomplete; a forced retry will scan all files");
         return;

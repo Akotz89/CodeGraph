@@ -263,6 +263,7 @@ async fn handle_branch_switch(
     old_commit: &str,
     new_commit: &str,
 ) -> Result<(usize, usize), Box<dyn std::error::Error + Send + Sync>> {
+    crate::watcher::validate_call_scope_configuration()?;
     // Get the list of changed files
     let root = ctx.workspace_root.clone();
     let old = old_commit.to_string();
