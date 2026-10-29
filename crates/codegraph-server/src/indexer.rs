@@ -776,6 +776,10 @@ pub struct IndexResult {
     pub total_files: usize,
     /// Files that were actually parsed (new or changed).
     pub files_parsed: usize,
+    /// Previously indexed files removed from the graph.
+    pub files_removed: usize,
+    /// Existing files received new volume metadata that must be persisted.
+    pub volume_metadata_changed: bool,
     /// Files skipped because their content hash was unchanged.
     pub files_skipped: usize,
     /// Per-language file counts (key: parser's `language()` string).
@@ -794,6 +798,263 @@ pub struct IndexResult {
 pub struct Indexer {
     parsers: Arc<ParserRegistry>,
     index_state: Arc<Mutex<IndexState>>,
+    mount_table: std::sync::RwLock<Option<Vec<(PathBuf, String, PathBuf)>>>,
+    uuid_cache: std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+}
+
+// Check every existing ancestor, not just metadata on the workspace root.
+// An unreadable directory can still report `is_dir() == true`.
+#[cfg(test)]
+fn readable_ancestors(path: &Path, root: &Path) -> bool {
+    readable_ancestors_cached(path, root, &mut std::collections::HashMap::new())
+}
+
+fn readable_ancestors_cached(path: &Path, root: &Path, cache: &mut std::collections::HashMap<PathBuf, bool>) -> bool {
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        if !dir.starts_with(root) {
+            return false;
+        }
+        let readable = *cache.entry(dir.to_path_buf()).or_insert_with(|| match std::fs::read_dir(dir) {
+            Ok(entries) => entries.into_iter().all(|entry| entry.is_ok()),
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound && dir != root,
+        });
+        if !readable { return false; }
+        if dir == root {
+            return true;
+        }
+        current = dir.parent();
+    }
+    false
+}
+
+// Identity lookup can take long enough for the file to be recreated. Check on
+// both sides of that lookup and reject a changed or unavailable identity.
+fn confirm_missing_with_identity(path: &Path, expected: &str, identity: impl FnOnce() -> Option<String>) -> bool {
+    matches!(path.try_exists(), Ok(false))
+        && identity().as_deref() == Some(expected)
+        && matches!(path.try_exists(), Ok(false))
+}
+
+// A mount point can remain as an empty directory when its volume disappears.
+// Linux mountinfo provides both a device and a filesystem-relative root;
+// the latter also distinguishes bind mounts on the same device.
+#[cfg(target_os = "linux")]
+fn parse_mount_table(table: &str) -> Option<Vec<(PathBuf, String, PathBuf)>> {
+    fn unescape(value: &str) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStringExt;
+        let bytes = value.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' {
+                if i + 3 >= bytes.len() || !bytes[i + 1..i + 4].iter().all(|b| (b'0'..=b'7').contains(b)) {
+                    return None;
+                }
+                let value = (bytes[i + 1] - b'0') as u16 * 64
+                    + (bytes[i + 2] - b'0') as u16 * 8 + (bytes[i + 3] - b'0') as u16;
+                if value > 255 { return None; }
+                decoded.push(value as u8);
+                i += 4;
+            } else {
+                decoded.push(bytes[i]);
+                i += 1;
+            }
+        }
+        Some(PathBuf::from(std::ffi::OsString::from_vec(decoded)))
+    }
+    table.lines().map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 7 || !fields.contains(&"-") { return None; }
+        Some((unescape(fields[4])?, fields[2].to_string(), unescape(fields[3])?))
+    }).collect()
+}
+
+fn mount_identity_from_entries(entries: &[(PathBuf, String, PathBuf)], path: &Path) -> Option<(PathBuf, String, PathBuf)> {
+    entries.iter().filter(|(mount, _, _)| path.starts_with(mount))
+        .max_by_key(|(mount, _, _)| mount.components().count()).cloned()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn mount_identity_from_table(table: &str, path: &Path) -> Option<(PathBuf, String, PathBuf)> {
+    mount_identity_from_entries(&parse_mount_table(table)?, path)
+}
+
+fn current_mount_table() -> Option<Vec<(PathBuf, String, PathBuf)>> {
+    #[cfg(target_os = "linux")]
+    { parse_mount_table(&std::fs::read_to_string("/proc/self/mountinfo").ok()?) }
+    #[cfg(not(target_os = "linux"))]
+    { None }
+}
+
+#[derive(Default)]
+struct LiveMountTable {
+    raw: Option<String>,
+    parsed: Option<Vec<(PathBuf, String, PathBuf)>>,
+    #[cfg(target_os = "linux")]
+    uuid_stamp: Option<(u64, u64, i64, i64, i64, i64)>,
+    #[cfg(target_os = "linux")]
+    uuid_checked: Option<std::time::Instant>,
+    #[cfg(target_os = "linux")]
+    uuids: std::collections::HashMap<String, Option<String>>,
+}
+
+impl LiveMountTable {
+    #[cfg(target_os = "linux")]
+    fn update(&mut self, raw: String) -> Option<&[(PathBuf, String, PathBuf)]> {
+        if self.raw.as_ref() != Some(&raw) {
+            self.parsed = parse_mount_table(&raw);
+            self.raw = Some(raw);
+            self.uuids.clear();
+            self.uuid_checked = None;
+        }
+        self.parsed.as_deref()
+    }
+
+    fn refresh(&mut self) -> Option<&[(PathBuf, String, PathBuf)]> {
+        #[cfg(target_os = "linux")]
+        {
+            match std::fs::read_to_string("/proc/self/mountinfo") {
+                Ok(raw) => self.update(raw),
+                Err(_) => { self.raw = None; self.parsed = None; None }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        { None }
+    }
+
+    fn identity(&mut self, path: &Path) -> Option<String> {
+        self.identity_with_uuid_directory(path, Path::new("/dev/disk/by-uuid"))
+    }
+
+    fn identity_with_uuid_directory(&mut self, path: &Path, uuid_dir: &Path) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let canonical = canonical_candidate(path)?;
+            let mount = mount_identity_from_entries(self.refresh()?, &canonical)?;
+            let meta = std::fs::metadata(uuid_dir).ok()?;
+            let stamp = (meta.dev(), meta.ino(), meta.mtime(), meta.mtime_nsec(), meta.ctime(), meta.ctime_nsec());
+            if self.uuid_stamp != Some(stamp) || self.uuid_checked.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1)) {
+                self.uuids.clear();
+                self.uuid_stamp = Some(stamp);
+                self.uuid_checked = Some(std::time::Instant::now());
+            }
+            let uuid = self.uuids.entry(mount.1.clone())
+                .or_insert_with(|| filesystem_uuid_in(&mount.1, uuid_dir)).clone()?;
+            // Device-mapper topology can change without a mount-table change.
+            let device_id = filesystem_device_id(&mount.1)?;
+            let volume = serde_json::to_string(&(uuid, device_id)).ok()?;
+            serde_json::to_string(&(mount, volume)).ok()
+        }
+        #[cfg(not(target_os = "linux"))]
+        { let _ = (path, uuid_dir); None }
+    }
+}
+
+// Device numbers can be reassigned after unplugging a volume. A filesystem
+// UUID makes a match meaningful across remounts; if no UUID is available,
+// retain missing paths rather than guessing.
+// UUIDs may be cloned. Require a hardware or virtual-disk identifier as well,
+// and keep stale entries when the platform cannot provide one.
+#[cfg(target_os = "linux")]
+fn filesystem_device_id(device: &str) -> Option<String> {
+    filesystem_device_id_in(device, Path::new("/sys/dev/block"))
+}
+
+#[cfg(target_os = "linux")]
+fn filesystem_device_id_in(device: &str, sys_root: &Path) -> Option<String> {
+    if !device.split(':').all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
+        || device.matches(':').count() != 1 { return None; }
+    let sys = sys_root.join(device);
+    // Device-mapper UUIDs can be cloned with their on-disk metadata, so bind
+    // the mapping to every underlying device's identity as well.
+    let is_dm = sys.join("dm").try_exists().ok()?;
+    if is_dm {
+        let dm_uuid = std::fs::read_to_string(sys.join("dm/uuid")).ok()?;
+        let dm_uuid = dm_uuid.trim();
+        if dm_uuid.is_empty() || dm_uuid.len() > 256 { return None; }
+        let mut children = Vec::new();
+        for entry in std::fs::read_dir(sys.join("slaves")).ok()? {
+            let entry = entry.ok()?;
+            let child = std::fs::read_to_string(entry.path().join("dev")).ok()?;
+            let child = child.trim();
+            if child == device { return None; }
+            // Do not recurse through nested mappings: without cycle detection
+            // their identity cannot be established safely here.
+            if sys_root.join(child).join("dm").try_exists().ok()? { return None; }
+            // The same disk WWID can back multiple partitions; retain the
+            // child's device number as well so they do not collapse together.
+            children.push((child.to_owned(), filesystem_device_id_in(child, sys_root)?));
+        }
+        if children.is_empty() { return None; }
+        children.sort();
+        // Refuse a mixed observation if the mapping changed while the backing
+        // identities were being read.
+        let mut after = Vec::new();
+        for entry in std::fs::read_dir(sys.join("slaves")).ok()? {
+            let entry = entry.ok()?;
+            let child = std::fs::read_to_string(entry.path().join("dev")).ok()?;
+            let child = child.trim();
+            if child == device || sys_root.join(child).join("dm").try_exists().ok()? { return None; }
+            after.push((child.to_owned(), filesystem_device_id_in(child, sys_root)?));
+        }
+        after.sort();
+        if children != after || std::fs::read_to_string(sys.join("dm/uuid")).ok()?.trim() != dm_uuid {
+            return None;
+        }
+        return serde_json::to_string(&("device-mapper", dm_uuid, children)).ok();
+    }
+    for candidate in [sys.join("device/wwid"), sys.join("wwid"), sys.join("../device/wwid"), sys.join("../wwid")] {
+        if let Ok(value) = std::fs::read_to_string(candidate) {
+            let value = value.trim();
+            if !value.is_empty() && value.len() <= 256 { return Some(value.to_owned()); }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn filesystem_uuid_in(device: &str, uuid_dir: &Path) -> Option<String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let mut parts = device.split(':');
+    let major: u64 = parts.next()?.parse().ok()?;
+    let minor: u64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() { return None; }
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(uuid_dir).ok()? {
+        // An unreadable entry prevents proving uniqueness; fail closed.
+        let entry = entry.ok()?;
+        let meta = std::fs::metadata(entry.path()).ok()?;
+        if !meta.file_type().is_block_device() { return None; }
+        let dev = meta.rdev();
+        let entry_major = ((dev >> 8) & 0xfff) | ((dev >> 32) & 0xfffff000);
+        let entry_minor = (dev & 0xff) | ((dev >> 12) & 0xffffff00);
+        if entry_major == major && entry_minor == minor {
+            if let Some(uuid) = entry.file_name().to_str() { matches.push(uuid.to_owned()); }
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    (matches.len() == 1).then(|| matches.remove(0))
+}
+
+// During one workspace walk the captured mount table is shared. Resolve each
+// backing device's UUID once instead of scanning /dev for every source file.
+fn cached_volume_identity(table: Option<&[(PathBuf, String, PathBuf)]>, path: &Path, cache: &std::sync::Mutex<std::collections::HashMap<String, Option<String>>>) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mount = mount_identity_from_entries(table?, &canonical_candidate(path)?)?;
+        let mut cache = cache.lock().ok()?;
+        let uuid = cache.entry(mount.1.clone())
+            .or_insert_with(|| filesystem_uuid_in(&mount.1, Path::new("/dev/disk/by-uuid"))).clone()?;
+        drop(cache);
+        let device_id = filesystem_device_id(&mount.1)?;
+        let volume = serde_json::to_string(&(uuid, device_id)).ok()?;
+        serde_json::to_string(&(mount, volume)).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = (table, path, cache); None }
 }
 
 impl Indexer {
@@ -802,6 +1063,19 @@ impl Indexer {
         Self {
             parsers,
             index_state,
+            mount_table: std::sync::RwLock::new(current_mount_table()),
+            uuid_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Refresh mount data and its dependent UUID cache as one generation.
+    pub(crate) fn refresh_mount_snapshot(&self) {
+        if let Ok(mut table) = self.mount_table.write() {
+            // Keep the write lock while clearing: readers take table before cache.
+            match self.uuid_cache.lock() {
+                Ok(mut cache) => { cache.clear(); *table = current_mount_table(); }
+                Err(_) => *table = None,
+            }
         }
     }
 
@@ -832,6 +1106,7 @@ impl Indexer {
         let _phase = crate::crash_phase::enter("index_parse");
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut result = IndexResult::default();
+        self.refresh_mount_snapshot();
 
         for folder in folders {
             // Bounty 2026-05-03 — extend exclude_patterns from this
@@ -898,6 +1173,58 @@ impl Indexer {
             }
         }
 
+        // A watcher cannot observe deletes made while the server was stopped.
+        // Only prune missing paths under currently accessible workspace roots.
+        let roots: Vec<(PathBuf, bool)> = folders.iter().filter_map(|root| {
+            canonical_candidate(root).map(|path| (path, std::fs::read_dir(root).is_ok()))
+        }).collect();
+        let missing: Vec<PathBuf> = {
+            let state = self.index_state.lock().await;
+            let mut accessible = std::collections::HashMap::new();
+            state.all_hashes().keys().filter(|path| {
+                matches!(path.try_exists(), Ok(false)) && canonical_candidate(path).is_some_and(|p| {
+                    roots.iter().filter(|(root, _)| p.starts_with(root))
+                        .max_by_key(|(root, _)| root.components().count())
+                        .is_some_and(|(root, available)| *available && readable_ancestors_cached(&p, root, &mut accessible))
+                })
+            }).cloned().collect()
+        };
+        let mut reappeared = Vec::new();
+        {
+            let mut g = graph.write().await;
+            let mut state = self.index_state.lock().await;
+            let mut accessible = std::collections::HashMap::new();
+            let mut mounts = LiveMountTable::default();
+            for path in missing {
+                if !matches!(path.try_exists(), Ok(false)) { continue; }
+                let Some(canonical) = canonical_candidate(&path) else { continue; };
+                let Some(root) = roots.iter().filter(|(root, _)| canonical.starts_with(root))
+                    .max_by_key(|(root, _)| root.components().count()) else { continue; };
+                if !readable_ancestors_cached(&canonical, &root.0, &mut accessible) { continue; }
+                let current = mounts.identity(&canonical);
+                if current.as_deref().is_none() || state.volume(&path) != current.as_deref() { continue; }
+                if !confirm_missing_with_identity(&path, current.as_deref().unwrap(), || mounts.identity(&canonical)) { continue; }
+                let mut deleted = true;
+                for id in g.nodes_by_path(&path.to_string_lossy()) {
+                    if let Err(error) = g.delete_node(id) {
+                        tracing::warn!("Failed to remove deleted {:?} from graph: {}", path, error);
+                        deleted = false;
+                    }
+                }
+                if deleted {
+                    state.remove(&path);
+                    result.files_removed += 1;
+                    if matches!(path.try_exists(), Ok(true)) {
+                        reappeared.push(path);
+                    }
+                }
+            }
+        }
+
+        // If a file reappeared after the last check, rebuild it after releasing
+        // the locks; the hash was removed so indexing cannot skip it as unchanged.
+        result.files_parsed += self.reindex_reappeared(graph, folders, config, reappeared).await;
+
         // Resolve cross-file imports
         {
             let mut g = graph.write().await;
@@ -920,7 +1247,27 @@ impl Indexer {
             }
         }
 
+        result.volume_metadata_changed = self.index_state.lock().await.volumes_dirty();
         result
+    }
+
+    async fn reindex_reappeared(&self, graph: &Arc<RwLock<CodeGraph>>, folders: &[PathBuf], config: &IndexConfig, paths: Vec<PathBuf>) -> usize {
+        if paths.is_empty() { return 0; }
+        self.refresh_mount_snapshot();
+        let filter = WorkspaceFilter::new(folders, config);
+        let mut parsed = 0;
+        for path in paths {
+            if !filter.admits(&path) {
+                tracing::warn!("Skipping recreated path that no longer passes workspace filters");
+                continue;
+            }
+            match self.index_file(graph, &path).await {
+                Ok(true) => parsed += 1,
+                Ok(false) => {},
+                Err(error) => tracing::warn!("Failed to reindex recreated {:?}: {}", path, error),
+            }
+        }
+        parsed
     }
 
     /// Persist file hashes only after the caller has successfully persisted
@@ -928,6 +1275,7 @@ impl Indexer {
     pub async fn save_index_state(&self) -> bool {
         let mut state = self.index_state.lock().await;
         if state.save() {
+            state.acknowledge_volumes_saved();
             true
         } else {
             state.invalidate_saved_state();
@@ -1016,6 +1364,8 @@ impl Indexer {
     > {
         Box::pin(async move {
             use std::sync::atomic::Ordering;
+
+            if depth == 0 { self.refresh_mount_snapshot(); }
 
             let empty_by_lang: std::collections::HashMap<String, usize> = Default::default();
             let empty_errors: std::collections::HashMap<String, usize> = Default::default();
@@ -1157,9 +1507,11 @@ impl Indexer {
 
         // Check if file content has changed since last index
         {
-            let state = self.index_state.lock().await;
+            let mut state = self.index_state.lock().await;
             if let Some(cached_hash) = state.get_hash(path) {
                 if cached_hash == hash {
+                    let identity = self.mount_table.read().ok().and_then(|table| cached_volume_identity(table.as_deref(), path, &self.uuid_cache));
+                    if let Some(identity) = identity { state.set_volume(path, identity); }
                     return Ok(false); // Unchanged
                 }
             }
@@ -1179,6 +1531,8 @@ impl Indexer {
                     // Update hash in index state
                     let mut state = self.index_state.lock().await;
                     state.set_hash(path.to_path_buf(), hash);
+                    let identity = self.mount_table.read().ok().and_then(|table| cached_volume_identity(table.as_deref(), path, &self.uuid_cache));
+                    if let Some(identity) = identity { state.set_volume(path, identity); }
                     Ok(true)
                 }
                 Err(e) => Err(format!("{:?}", e)),
@@ -1191,6 +1545,297 @@ impl Indexer {
 mod tests {
     use super::*;
     use codegraph::{NamespacedBackend, NodeType, PropertyMap, RocksDBBackend};
+
+    #[test]
+    fn missing_file_recreated_during_identity_check_is_not_pruned() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.rs");
+        assert!(confirm_missing_with_identity(&path, "same", || Some("same".into())));
+        assert!(!confirm_missing_with_identity(&path, "same", || Some("changed".into())));
+        assert!(!confirm_missing_with_identity(&path, "same", || {
+            std::fs::write(&path, "fn recreated() {}\n").unwrap();
+            Some("same".into())
+        }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reappeared_paths_are_reindexed_only_when_still_in_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let allowed = root.join("allowed.rs");
+        let outside = temp.path().join("outside.rs");
+        let redirected = root.join("redirected.rs");
+        std::fs::write(&allowed, "fn returned_symbol() {}\n").unwrap();
+        std::fs::write(&outside, "fn outside_symbol() {}\n").unwrap();
+        std::os::unix::fs::symlink(&outside, &redirected).unwrap();
+        let state = Arc::new(Mutex::new(IndexState::for_workspace("reappeared-filter", &root)));
+        let indexer = Indexer::new(Arc::new(ParserRegistry::new()), state.clone());
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        let parsed = indexer.reindex_reappeared(&graph, &[root], &IndexConfig::default(), vec![allowed.clone(), redirected.clone()]).await;
+        assert_eq!(parsed, 1);
+        assert!(state.lock().await.get_hash(&allowed).is_some());
+        assert!(state.lock().await.get_hash(&redirected).is_none());
+        let graph = graph.read().await;
+        assert!(graph.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("returned_symbol")));
+        assert!(!graph.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("outside_symbol")));
+    }
+
+    #[test]
+    fn refresh_waits_for_readers_before_clearing_volume_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let indexer = Arc::new(Indexer::new(
+            Arc::new(ParserRegistry::new()),
+            Arc::new(Mutex::new(IndexState::for_workspace("refresh-lock", root.path()))),
+        ));
+        indexer.uuid_cache.lock().unwrap().insert("old-device".into(), Some("old-uuid".into()));
+        let read_guard = indexer.mount_table.read().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let other = indexer.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            other.refresh_mount_snapshot();
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+        assert!(indexer.uuid_cache.lock().unwrap().contains_key("old-device"));
+        drop(read_guard);
+        done_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        assert!(indexer.uuid_cache.lock().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mount_identity_distinguishes_missing_and_bind_mounted_volumes() {
+        let root = "1 0 8:1 / / rw - ext4 /dev/root rw\n";
+        let mounted = format!("{root}2 1 8:1 /actual /mnt/source\\040disk rw - ext4 /dev/root rw\n");
+        let file = Path::new("/mnt/source disk/module/file.cpp");
+        let original = mount_identity_from_table(&mounted, file).unwrap();
+        assert_eq!(original.0, PathBuf::from("/mnt/source disk"));
+        assert_eq!(original.2, PathBuf::from("/actual"));
+        let disconnected = mount_identity_from_table(root, file).unwrap();
+        assert_ne!(original, disconnected);
+        assert!(mount_identity_from_table("malformed", file).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_mount_table_reparses_changes_and_rejects_invalid_data() {
+        let mut live = LiveMountTable::default();
+        let root = "1 0 8:1 / / rw - ext4 /dev/root rw\n";
+        let file = Path::new("/mnt/target/file.rs");
+        assert_eq!(mount_identity_from_entries(live.update(root.into()).unwrap(), file).unwrap().0, PathBuf::from("/"));
+        live.uuids.insert("8:1".into(), Some("old".into()));
+        assert!(live.update(root.into()).is_some());
+        assert!(live.uuids.contains_key("8:1"));
+        let changed = format!("{root}2 1 8:2 / /mnt/target rw - ext4 /dev/other rw\n");
+        assert_eq!(mount_identity_from_entries(live.update(changed).unwrap(), file).unwrap().0, PathBuf::from("/mnt/target"));
+        assert!(live.uuids.is_empty());
+        assert!(live.update("invalid".into()).is_none());
+        assert!(live.update(root.into()).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_or_broken_uuid_directory_never_authorizes_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let uuid_dir = temp.path().join("uuid");
+        assert!(filesystem_uuid_in("0:0", &uuid_dir).is_none());
+        std::fs::create_dir(&uuid_dir).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("missing-device"), uuid_dir.join("broken")).unwrap();
+        assert!(filesystem_uuid_in("0:0", &uuid_dir).is_none());
+        let mut live = LiveMountTable::default();
+        assert!(live.identity_with_uuid_directory(temp.path(), &uuid_dir).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_identity_handles_missing_partition_and_cloned_filesystem() {
+        let temp = tempfile::tempdir().unwrap();
+        let devices = temp.path().join("devices");
+        let block = temp.path().join("block");
+        std::fs::create_dir_all(&block).unwrap();
+        for (name, wwid) in [("disk-a", "device-a"), ("disk-b", "device-b")] {
+            let disk = devices.join(name);
+            std::fs::create_dir_all(disk.join("device")).unwrap();
+            std::fs::create_dir_all(disk.join("part")).unwrap();
+            std::fs::write(disk.join("device/wwid"), wwid).unwrap();
+        }
+        std::os::unix::fs::symlink(devices.join("disk-a/part"), block.join("8:1")).unwrap();
+        std::os::unix::fs::symlink(devices.join("disk-b/part"), block.join("8:2")).unwrap();
+        std::fs::create_dir_all(devices.join("disk-a/part2")).unwrap();
+        std::os::unix::fs::symlink(devices.join("disk-a/part2"), block.join("8:3")).unwrap();
+        assert!(filesystem_device_id_in("8:9", &block).is_none());
+        assert!(filesystem_device_id_in("../../bad", &block).is_none());
+        let first = filesystem_device_id_in("8:1", &block).unwrap();
+        let second = filesystem_device_id_in("8:2", &block).unwrap();
+        assert_eq!(first, "device-a");
+        assert_eq!(second, "device-b");
+        assert_ne!(("same-filesystem-uuid", first), ("same-filesystem-uuid", second));
+        let mapped = block.join("253:0");
+        std::fs::create_dir_all(mapped.join("dm")).unwrap();
+        std::fs::create_dir_all(mapped.join("slaves/disk")).unwrap();
+        std::fs::write(mapped.join("dm/uuid"), "same-mapping-uuid").unwrap();
+        std::fs::write(mapped.join("slaves/disk/dev"), "8:1").unwrap();
+        let mapped_a = filesystem_device_id_in("253:0", &block).unwrap();
+        std::fs::write(mapped.join("slaves/disk/dev"), "8:3").unwrap();
+        let mapped_other_partition = filesystem_device_id_in("253:0", &block).unwrap();
+        assert_ne!(mapped_a, mapped_other_partition);
+        std::fs::write(mapped.join("slaves/disk/dev"), "8:2").unwrap();
+        let mapped_b = filesystem_device_id_in("253:0", &block).unwrap();
+        assert_ne!(mapped_a, mapped_b);
+        std::fs::write(mapped.join("slaves/disk/dev"), "8:9").unwrap();
+        assert!(filesystem_device_id_in("253:0", &block).is_none());
+        // A present DM directory with an unreadable UUID must not fall back
+        // to a WWID and be treated as an ordinary disk.
+        std::fs::remove_file(mapped.join("dm/uuid")).unwrap();
+        std::fs::create_dir(mapped.join("dm/uuid")).unwrap();
+        std::fs::write(mapped.join("wwid"), "unsafe-fallback").unwrap();
+        assert!(filesystem_device_id_in("253:0", &block).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uuid_cache_expires_and_directory_change_invalidates_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let uuid_dir = temp.path().join("uuid");
+        std::fs::create_dir(&uuid_dir).unwrap();
+        let mut live = LiveMountTable::default();
+        assert!(live.identity_with_uuid_directory(temp.path(), &uuid_dir).is_none());
+        live.uuids.insert("sentinel".into(), Some("stale".into()));
+        live.uuid_checked = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        assert!(live.identity_with_uuid_directory(temp.path(), &uuid_dir).is_none());
+        assert!(!live.uuids.contains_key("sentinel"));
+        live.uuids.insert("sentinel".into(), Some("stale".into()));
+        std::fs::write(uuid_dir.join("new-entry"), "x").unwrap();
+        assert!(live.identity_with_uuid_directory(temp.path(), &uuid_dir).is_none());
+        assert!(!live.uuids.contains_key("sentinel"));
+    }
+
+    #[test]
+    fn missing_path_ancestors_must_be_enumerable() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let deleted = nested.join("deleted.rs");
+        assert!(readable_ancestors(&deleted, root.path()));
+        std::fs::remove_dir(&nested).unwrap();
+        assert!(readable_ancestors(&deleted, root.path()));
+        std::fs::write(&nested, "not a directory").unwrap();
+        assert!(!readable_ancestors(&deleted, root.path()));
+        assert!(!readable_ancestors(&deleted, &root.path().join("other")));
+    }
+
+    #[tokio::test]
+    async fn incremental_reindex_prunes_deleted_paths_only_in_available_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let unavailable = root.join("unavailable");
+        std::fs::create_dir_all(&root).unwrap();
+        let deleted = root.join("removed.rs");
+        let kept = root.join("kept.rs");
+        let elsewhere = temp.path().join("outside.rs");
+        let offline = unavailable.join("offline.rs");
+        std::fs::write(&deleted, "fn deleted_example() {}\n").unwrap();
+        std::fs::write(&kept, "fn kept_example() {}\n").unwrap();
+        let parsers = Arc::new(ParserRegistry::new());
+        let state = Arc::new(Mutex::new(IndexState::for_workspace("deleted-path-test", &root)));
+        let indexer = Indexer::new(parsers.clone(), state.clone());
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        let mut config = IndexConfig::default();
+        config.explicit_source_extensions = parsers.supported_extensions().iter()
+            .map(|s| s.trim_start_matches('.').to_string()).collect();
+        indexer.index_workspace(&graph, std::slice::from_ref(&root), &config).await;
+        assert!(!graph.write().await.nodes_by_path(&deleted.to_string_lossy()).is_empty());
+        assert!(state.lock().await.get_hash(&deleted).is_some());
+        let identifiable = state.lock().await.volume(&deleted).is_some();
+        state.lock().await.set_hash(elsewhere.clone(), 1);
+        state.lock().await.set_hash(offline.clone(), 2);
+        std::fs::remove_file(&deleted).unwrap();
+        let result = indexer.index_workspace(&graph, &[root.clone(), unavailable], &config).await;
+        assert_eq!(result.files_parsed, 0);
+        assert_eq!(result.files_removed, usize::from(identifiable));
+        let mut g = graph.write().await;
+        assert_eq!(g.nodes_by_path(&deleted.to_string_lossy()).is_empty(), identifiable);
+        assert!(!g.nodes_by_path(&kept.to_string_lossy()).is_empty());
+        drop(g);
+        let hashes = state.lock().await;
+        assert_eq!(hashes.get_hash(&deleted).is_none(), identifiable);
+        assert!(hashes.get_hash(&kept).is_some());
+        assert_eq!(hashes.get_hash(&elsewhere), Some(1));
+        assert_eq!(hashes.get_hash(&offline), Some(2));
+        drop(hashes);
+        let db = temp.path().join("graph.db");
+        indexer.persist_graph_snapshot(&graph, |graph| {
+            let backend = RocksDBBackend::open(&db).map_err(|error| error.to_string())?;
+            graph.persist_to(Box::new(NamespacedBackend::new(Box::new(backend), "deleted-path-test")))
+                .map_err(|error| error.to_string())
+        }).await.unwrap();
+        let backend = RocksDBBackend::open(&db).unwrap();
+        let mut restored = CodeGraph::with_backend(Box::new(NamespacedBackend::new(
+            Box::new(backend), "deleted-path-test"))).unwrap();
+        assert_eq!(restored.nodes_by_path(&deleted.to_string_lossy()).is_empty(), identifiable);
+        assert!(!restored.nodes_by_path(&kept.to_string_lossy()).is_empty());
+        restored.detach_storage().unwrap();
+        let mut restored_state = IndexState::for_workspace("deleted-path-test", &root);
+        restored_state.load();
+        assert_eq!(restored_state.get_hash(&deleted).is_none(), identifiable);
+        assert!(restored_state.get_hash(&kept).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn incremental_pruning_accepts_symlinked_workspace_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let alias = temp.path().join("alias");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let deleted = alias.join("deleted.rs");
+        std::fs::write(&deleted, "fn symlinked_file() {}\n").unwrap();
+        let parsers = Arc::new(ParserRegistry::new());
+        let state = Arc::new(Mutex::new(IndexState::for_workspace("symlink-prune", &real)));
+        let indexer = Indexer::new(parsers, state.clone());
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        let config = IndexConfig::default();
+        indexer.index_workspace(&graph, std::slice::from_ref(&alias), &config).await;
+        assert!(state.lock().await.get_hash(&deleted).is_some());
+        let identifiable = state.lock().await.volume(&deleted).is_some();
+        std::fs::remove_file(&deleted).unwrap();
+        let result = indexer.index_workspace(&graph, std::slice::from_ref(&alias), &config).await;
+        assert_eq!(result.files_removed, usize::from(identifiable));
+        assert_eq!(state.lock().await.get_hash(&deleted).is_none(), identifiable);
+        assert_eq!(graph.write().await.nodes_by_path(&deleted.to_string_lossy()).is_empty(), identifiable);
+    }
+
+    #[tokio::test]
+    async fn missing_legacy_volume_identity_preserves_graph_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = root.join("legacy.rs");
+        std::fs::write(&source, "fn legacy_source() {}\n").unwrap();
+        let state = Arc::new(Mutex::new(IndexState::for_workspace("legacy-volume", root)));
+        let indexer = Indexer::new(Arc::new(ParserRegistry::new()), state.clone());
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        indexer.index_workspace(&graph, &[root.to_path_buf()], &IndexConfig::default()).await;
+        {
+            let mut state = state.lock().await;
+            let hash = state.get_hash(&source).unwrap();
+            // Model a legacy checkpoint that has a hash but no volume sidecar.
+            state.set_hash(source.clone(), hash.wrapping_add(1));
+            state.set_hash(source.clone(), hash);
+            assert!(state.volume(&source).is_none());
+        }
+        std::fs::remove_file(&source).unwrap();
+        let result = indexer.index_workspace(&graph, &[root.to_path_buf()], &IndexConfig::default()).await;
+        assert_eq!(result.files_removed, 0);
+        assert!(state.lock().await.get_hash(&source).is_some());
+        assert!(!graph.write().await.nodes_by_path(&source.to_string_lossy()).is_empty());
+    }
 
     #[tokio::test]
     async fn hashes_commit_after_graph_success_and_stale_state_is_invalidated_on_failure() {

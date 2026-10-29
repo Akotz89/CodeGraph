@@ -640,6 +640,7 @@ fn path_key(path: &Path) -> String {
 
 /// Process accumulated file changes: re-index changed files, remove deleted files.
 async fn process_changes(ctx: &WatcherCtx, changed: &[PathBuf], removed: &[PathBuf]) {
+    ctx.indexer.refresh_mount_snapshot();
     tracing::info!(
         "[file-watcher] Processing {} changes ({} modified, {} deleted)",
         changed.len() + removed.len(),
@@ -1144,7 +1145,13 @@ mod tests {
         for index in 0..1200 {
             std::fs::create_dir(root.join(format!("overflow_{index:04}"))).unwrap();
         }
-        assert!(watcher.overflow_count() > 0, "event queue did not overflow");
+        // Filesystem notifications arrive asynchronously; the final mkdir
+        // returning does not mean the callback has delivered its events yet.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while watcher.overflow_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("event queue did not overflow");
         drop(watcher_lock);
         std::fs::write(&generated, "function generated_after_overflow() {}\n").unwrap();
         std::fs::write(&selected, "function after_overflow_selected() { :; }\n").unwrap();

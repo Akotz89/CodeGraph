@@ -241,6 +241,15 @@ Indexing produced zero files, or something else looks wrong? See
 | `index_files` | Add/update specific files without full reindex |
 | `index_directory` | Add directory to graph alongside existing data |
 
+Incremental reindexing can remove entries for files deleted while the server
+was stopped. On Linux it does so only when the saved volume identity can be
+matched to an accessible current source location. Entries without a verified
+identity, including entries from older checkpoints, remain until a clean
+rebuild. Sources without the required filesystem UUID and device identifier,
+nested device-mapper setups, and non-Linux systems also retain those entries.
+Volume identifiers are supplied by the operating system and are not a guarantee
+against cloned devices presenting identical identifiers.
+
 ### Memory (7)
 
 Persistent AI context across sessions — debugging insights, architectural decisions, known issues.
