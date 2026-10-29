@@ -74,20 +74,9 @@ pub(crate) async fn get_callers(
             .unwrap_or_default()
     };
 
-    let mut result = query_engine.get_callers(node_id, depth).await;
-
-    // If no callers found, check for same-name variants in other files
-    // (handles multi-arch C codebases where the same function exists in
-    // arch-specific files like backdoorGcc32.c / backdoorGcc64.c)
-    if result.is_empty() && !symbol_name.is_empty() {
-        let g = graph.read().await;
-        let variants = find_same_name_variants(&g, &symbol_name, node_id);
-        drop(g);
-        for variant_id in variants {
-            let variant_callers = query_engine.get_callers(variant_id, depth).await;
-            result.extend(variant_callers);
-        }
-    }
+    // Node IDs identify individual definitions, including copies in separate
+    // workspaces. A same-name definition is not evidence for this node.
+    let result = query_engine.get_callers(node_id, depth).await;
 
     let diagnostic = if result.is_empty() {
         let edge_count = {
@@ -139,18 +128,7 @@ pub(crate) async fn get_callees(
             .unwrap_or_default()
     };
 
-    let mut result = query_engine.get_callees(node_id, depth).await;
-
-    // Check same-name variants for callees (multi-arch dedup)
-    if result.is_empty() && !symbol_name.is_empty() {
-        let g = graph.read().await;
-        let variants = find_same_name_variants(&g, &symbol_name, node_id);
-        drop(g);
-        for variant_id in variants {
-            let variant_callees = query_engine.get_callees(variant_id, depth).await;
-            result.extend(variant_callees);
-        }
-    }
+    let result = query_engine.get_callees(node_id, depth).await;
 
     let diagnostic = if result.is_empty() {
         let edge_count = {
@@ -187,25 +165,6 @@ pub(crate) async fn get_callees(
 // Private Helpers
 // ============================================================
 
-/// Find other function nodes with the same name but different node ID.
-/// Used for multi-arch symbol deduplication (e.g. same function in
-/// backdoorGcc32.c and backdoorGcc64.c).
-fn find_same_name_variants(graph: &CodeGraph, name: &str, exclude_id: NodeId) -> Vec<NodeId> {
-    graph
-        .nodes_iter()
-        .filter_map(|(&nid, node)| {
-            if nid != exclude_id
-                && node.node_type == codegraph::NodeType::Function
-                && node_props::name(node) == name
-            {
-                Some(nid)
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
 fn build_fallback(
     used_fallback: bool,
     requested_line: Option<u32>,
@@ -222,5 +181,33 @@ fn build_fallback(
         )
     } else {
         (None, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codegraph::{EdgeType, NodeType, PropertyMap};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn exact_symbol_does_not_borrow_edges_from_same_named_copy() {
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        let (requested, other, caller, callee) = {
+            let mut g = graph.write().await;
+            let requested = g.add_node(NodeType::Function, PropertyMap::new().with("name", "helper").with("path", "/candidate/helper.cpp")).unwrap();
+            let other = g.add_node(NodeType::Function, PropertyMap::new().with("name", "helper").with("path", "/fixture/helper.cpp")).unwrap();
+            let caller = g.add_node(NodeType::Function, PropertyMap::new().with("name", "caller")).unwrap();
+            let callee = g.add_node(NodeType::Function, PropertyMap::new().with("name", "callee")).unwrap();
+            g.add_edge(caller, other, EdgeType::Calls, PropertyMap::new()).unwrap();
+            g.add_edge(other, callee, EdgeType::Calls, PropertyMap::new()).unwrap();
+            (requested, other, caller, callee)
+        };
+        let engine = QueryEngine::new(Arc::clone(&graph));
+        engine.build_indexes().await;
+        assert!(get_callers(&graph, &engine, requested, 1, false, None).await.callers.is_empty());
+        assert!(get_callees(&graph, &engine, requested, 1, false, None).await.callees.is_empty());
+        assert_eq!(get_callers(&graph, &engine, other, 1, false, None).await.callers[0].node_id, caller);
+        assert_eq!(get_callees(&graph, &engine, other, 1, false, None).await.callees[0].node_id, callee);
     }
 }

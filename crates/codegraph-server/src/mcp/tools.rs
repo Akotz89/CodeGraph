@@ -839,7 +839,7 @@ fn get_callers_tool() -> Tool {
 
     Tool {
         name: "codegraph_get_callers".to_string(),
-        description: Some("Finds all functions that call a target function (reverse call graph). USE WHEN: understanding function usage, finding all invocation sites, or assessing change impact. SIMPLER than traverse_graph for this common use case. Returns callers array with symbol name and node ID. Use depth>1 to trace the full caller chain (who calls the callers). Identify target via uri+line or nodeId from symbol_search.".to_string()),
+        description: Some("Finds all functions that call a target function (reverse call graph). USE WHEN: understanding function usage, finding all invocation sites, or assessing change impact. SIMPLER than traverse_graph for this common use case. Returns callers array with symbol name and node ID. Use depth>1 to trace the full caller chain (who calls the callers). Identify target via uri+line or nodeId from symbol_search. Results are for that definition; query other same-name definitions separately.".to_string()),
         input_schema: ToolInputSchema {
             schema_type: "object".to_string(),
             properties: Some(properties),
@@ -872,7 +872,7 @@ fn get_callees_tool() -> Tool {
 
     Tool {
         name: "codegraph_get_callees".to_string(),
-        description: Some("Finds all functions called by a target function (forward call graph). USE WHEN: understanding function dependencies, tracing execution flow, or analyzing what code a function touches. SIMPLER than traverse_graph for this common use case. Returns callees array with symbol name and node ID. Use depth>1 to trace the full callee chain (what those callees call). Identify target via uri+line or nodeId from symbol_search.".to_string()),
+        description: Some("Finds all functions called by a target function (forward call graph). USE WHEN: understanding function dependencies, tracing execution flow, or analyzing what code a function touches. SIMPLER than traverse_graph for this common use case. Returns callees array with symbol name and node ID. Use depth>1 to trace the full callee chain (what those callees call). Identify target via uri+line or nodeId from symbol_search. Results are for that definition; query other same-name definitions separately.".to_string()),
         input_schema: ToolInputSchema {
             schema_type: "object".to_string(),
             properties: Some(properties),
