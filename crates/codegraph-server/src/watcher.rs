@@ -617,7 +617,7 @@ impl GraphUpdater {
         }
 
         let obsolete: Vec<_> = graph.iter_edges().filter_map(|(id, edge)| {
-            (edge.properties.get_string("resolved_by") == Some("sql_database_scope")).then_some(id)
+            matches!(edge.properties.get_string("resolved_by"), Some("sql_database_scope" | "code_sql_literal")).then_some(id)
         }).collect();
         for id in obsolete {
             if let Err(error) = graph.delete_edge(id) {
@@ -646,6 +646,30 @@ impl GraphUpdater {
                     PropertyMap::new().with("resolved_by", "sql_database_scope")) {
                     tracing::error!("Failed to add inferred SQL edge: {}", error);
                 }
+            }
+        }
+
+        let mut tables: HashMap<(String, String), Vec<NodeId>> = HashMap::new();
+        for ((scope, _, name), ids) in &definitions {
+            tables.entry((scope.clone(), name.clone())).or_default().extend(ids);
+        }
+        let mut links = HashSet::new();
+        for (id, node) in graph.iter_nodes() {
+            if node.node_type != codegraph::NodeType::Function { continue; }
+            let (Some(path), Some(names)) = (node.properties.get_string("path"), node.properties.get_string_list("sql_literal_tables")) else { continue; };
+            let root = scopes.keys().filter(|root| path.strip_prefix(root.as_str()).is_some_and(|rest| rest.starts_with('/'))).max_by_key(|root| root.len()).map(String::as_str)
+                .or_else(|| path.split_once("/src/").map(|(root, _)| root));
+            let Some(root) = root else { continue; };
+            let scope = match scopes.get(root) { Some(group) if !group.is_empty() => format!("group:{group}"), _ => format!("root:{root}") };
+            for name in names {
+                if let Some([table]) = tables.get(&(scope.clone(), name.clone())).map(Vec::as_slice) {
+                    links.insert((id, *table));
+                }
+            }
+        }
+        for (function, table) in links {
+            if let Err(error) = graph.add_edge(function, table, EdgeType::References, PropertyMap::new().with("resolved_by", "code_sql_literal")) {
+                tracing::error!("Failed to add inferred code SQL edge: {}", error);
             }
         }
     }
@@ -694,6 +718,50 @@ impl BatchUpdateResult {
 
 #[cfg(test)]
 mod tests {
+    fn parsed_function(graph: &mut codegraph::CodeGraph, source: &str) -> codegraph::NodeId {
+        use codegraph_parser_api::CodeParser;
+        codegraph_cpp::CppParser::new().parse_source(source, std::path::Path::new("/repo/src/f.cpp"), graph).unwrap().functions[0]
+    }
+
+    #[test]
+    fn cpp_sql_query_references_unique_table_definition() {
+        use codegraph::{CodeGraph, NodeType, PropertyMap};
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let source = format!("void f() {{ {} db.Query(\"SELECT receiver FROM mail\"); }}", "int n = 1; ".repeat(110));
+        let function = parsed_function(&mut graph, &source);
+        let node = graph.get_node(function).unwrap();
+        assert!(!node.properties.get_string("body_prefix").unwrap().contains("SELECT"));
+        assert_eq!(node.properties.get_string_list("sql_literal_tables").unwrap(), &["mail".to_string()]);
+        let table = graph.add_node(NodeType::Generic, PropertyMap::new()
+            .with("name", "mail").with("kind", "table")
+            .with("path", "/repo/data/sql/base/db_characters/mail.sql")).unwrap();
+        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new());
+        assert_eq!(graph.get_edges_between(function, table).unwrap().len(), 1);
+        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new());
+        assert_eq!(graph.get_edges_between(function, table).unwrap().len(), 1);
+        let duplicate = graph.add_node(NodeType::Generic, PropertyMap::new()
+            .with("name", "mail").with("kind", "table")
+            .with("path", "/repo/data/sql/base/db_world/mail.sql")).unwrap();
+        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new());
+        assert!(graph.get_edges_between(function, table).unwrap().is_empty());
+        assert!(graph.get_edges_between(function, duplicate).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cpp_sql_ignores_comments_unrelated_strings_ctes_and_other_roots() {
+        use codegraph::{CodeGraph, NodeType, PropertyMap};
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let function = parsed_function(&mut graph, r#"void f() { /* db.Query("SELECT * FROM mail"); */ log("SELECT * FROM mail"); db.Query("WITH mail AS (SELECT 1) SELECT * FROM mail"); db.Query("SELECT * FROM other"); }"#);
+        let local = graph.add_node(NodeType::Generic, PropertyMap::new()
+            .with("name", "mail").with("kind", "table")
+            .with("path", "/repo/data/sql/base/db_characters/mail.sql")).unwrap();
+        let foreign = graph.add_node(NodeType::Generic, PropertyMap::new()
+            .with("name", "other").with("kind", "table")
+            .with("path", "/different/data/sql/base/db_characters/other.sql")).unwrap();
+        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new());
+        assert!(graph.get_edges_between(function, local).unwrap().is_empty());
+        assert!(graph.get_edges_between(function, foreign).unwrap().is_empty());
+    }
     use super::*;
     use crate::domain::node_props;
 

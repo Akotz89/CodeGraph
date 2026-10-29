@@ -35,6 +35,7 @@
 mod extractor;
 mod mapper;
 mod parser_impl;
+mod sql_references;
 mod visitor;
 
 pub use parser_impl::CppParser;

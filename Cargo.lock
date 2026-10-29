@@ -625,6 +625,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sqlparser",
  "tempfile",
  "thiserror 1.0.69",
  "tree-sitter 0.25.10",

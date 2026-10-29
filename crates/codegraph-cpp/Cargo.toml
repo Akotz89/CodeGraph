@@ -22,6 +22,7 @@ thiserror.workspace = true
 # C++ parser
 tree-sitter = "0.25"
 tree-sitter-cpp = "0.23"
+sqlparser.workspace = true
 rayon = "1.10"
 
 [dev-dependencies]
