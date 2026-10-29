@@ -91,8 +91,15 @@ fn literal(node: Node<'_>, source: &str) -> Option<String> {
     Some(output)
 }
 
-fn collect_calls(root: Node<'_>, source: &str) -> HashSet<String> {
-    let mut result = HashSet::new();
+#[derive(Default)]
+struct Calls {
+    tables: HashSet<String>,
+    definitions: Vec<String>,
+    uses: HashSet<String>,
+}
+
+fn collect_calls(root: Node<'_>, source: &str) -> Calls {
+    let mut result = Calls::default();
     let mut pending = vec![root];
     while let Some(current) = pending.pop() {
         if current.kind() == "call_expression" {
@@ -105,17 +112,34 @@ fn collect_calls(root: Node<'_>, source: &str) -> HashSet<String> {
                     .unwrap_or(function)
                     .utf8_text(source.as_bytes())
                     .unwrap_or("");
-                let arg_index = match name.to_ascii_lowercase().as_str() {
+                let method = name.to_ascii_lowercase();
+                let identifier = arguments
+                    .named_child(0)
+                    .filter(|node| node.kind() == "identifier")
+                    .and_then(|node| node.utf8_text(source.as_bytes()).ok());
+                if method == "getpreparedstatement" {
+                    if let Some(identifier) = identifier {
+                        result.uses.insert(identifier.to_owned());
+                    }
+                }
+                let arg_index = match method.as_str() {
                     "query" | "execute" | "exec" | "prepare" => Some(0),
                     "preparestatement" => Some(1),
                     _ => None,
                 };
-                if let Some(sql) = arg_index
+                let tables = arg_index
                     .and_then(|i| arguments.named_child(i))
                     .and_then(|arg| literal(arg, source))
-                {
-                    result.extend(query_tables(&sql));
+                    .map(|sql| query_tables(&sql))
+                    .unwrap_or_default();
+                if method == "preparestatement" {
+                    if let Some(identifier) = identifier {
+                        result
+                            .definitions
+                            .push(format!("{}\t{}", identifier, tables.join("\t")));
+                    }
                 }
+                result.tables.extend(tables);
             }
         }
         let mut cursor = current.walk();
@@ -167,12 +191,18 @@ pub(crate) fn record(
                 functions.get(&key).map(Vec::as_slice),
                 node.child_by_field_name("body"),
             ) {
-                let mut tables: Vec<_> = collect_calls(body, source).into_iter().collect();
+                let calls = collect_calls(body, source);
+                let mut tables: Vec<_> = calls.tables.into_iter().collect();
                 tables.sort();
-                if !tables.is_empty() {
+                let mut uses: Vec<_> = calls.uses.into_iter().collect();
+                uses.sort();
+                if !tables.is_empty() || !uses.is_empty() || !calls.definitions.is_empty() {
                     graph.update_node_properties(
                         *id,
-                        PropertyMap::new().with("sql_literal_tables", tables),
+                        PropertyMap::new()
+                            .with("sql_literal_tables", tables)
+                            .with("sql_prepared_definitions", calls.definitions)
+                            .with("sql_prepared_uses", uses),
                     )?;
                 }
             }
