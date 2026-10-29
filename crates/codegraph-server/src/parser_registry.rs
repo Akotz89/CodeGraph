@@ -74,6 +74,14 @@ pub(crate) fn extensionless_source_kind(path: &Path) -> Option<&'static str> {
     match interpreter { "bash" | "sh" => Some("bash"), "python" | "python3" => Some("python"), "make" => Some("makefile"), _ => None }
 }
 
+/// Source templates with an unambiguous underlying language.
+pub(crate) fn source_template_kind(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()?.to_str()?;
+    if name.ends_with(".sh.dist") { Some("bash") }
+    else if name.ends_with(".h.in") { Some("c") }
+    else { None }
+}
+
 /// Registry of all available language parsers.
 pub struct ParserRegistry {
     bash: Arc<BashParser>,
@@ -243,6 +251,9 @@ impl ParserRegistry {
     /// C++-specific extensions (`.hpp`, `.cc`, `.cxx`, `.hh`, `.hxx`) are
     /// only claimed by the C++ parser and resolve correctly.
     pub fn parser_for_path(&self, path: &Path) -> Option<Arc<dyn CodeParser>> {
+        if let Some(kind) = source_template_kind(path) {
+            return match kind { "bash" => Some(self.bash.clone()), "c" => Some(self.c.clone()), _ => None };
+        }
         if let Some(kind) = extensionless_source_kind(path) {
             return match kind {
                 "bash" => Some(self.bash.clone()),
@@ -453,6 +464,7 @@ impl ParserRegistry {
     /// Note: `.h` files return `"c"` by convention (C-compatible headers).
     /// Use `.hpp`/`.hh`/`.hxx` for C++ headers.
     pub fn language_for_path(&self, path: &Path) -> Option<&'static str> {
+        if let Some(kind) = source_template_kind(path) { return Some(kind); }
         if self.build.can_parse(path) {
             return Some(match path.extension().and_then(|e| e.to_str()) {
                 Some("bats") => "bats",

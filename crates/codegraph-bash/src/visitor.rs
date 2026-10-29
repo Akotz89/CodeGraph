@@ -9,11 +9,18 @@ use codegraph_parser_api::{
 };
 use tree_sitter::Node;
 
+#[derive(Debug)]
+pub(crate) struct BashAssignment {
+    pub name: String,
+    pub line: usize,
+}
+
 pub(crate) struct BashVisitor<'a> {
     pub source: &'a [u8],
     pub functions: Vec<FunctionEntity>,
     pub imports: Vec<ImportRelation>,
     pub calls: Vec<CallRelation>,
+    pub assignments: Vec<BashAssignment>,
     current_function: Option<String>,
 }
 
@@ -24,6 +31,7 @@ impl<'a> BashVisitor<'a> {
             functions: Vec::new(),
             imports: Vec::new(),
             calls: Vec::new(),
+            assignments: Vec::new(),
             current_function: None,
         }
     }
@@ -40,6 +48,18 @@ impl<'a> BashVisitor<'a> {
             }
             "command" => {
                 self.visit_command(node);
+            }
+            "variable_assignment" => {
+                if let Some(mut name) = node.child_by_field_name("name") {
+                    if name.kind() == "subscript" {
+                        if let Some(inner) = name.child_by_field_name("name") { name = inner; }
+                    }
+                    if name.kind() == "variable_name" {
+                        let text = self.node_text(name);
+                        if !text.is_empty() { self.assignments.push(BashAssignment { name: text, line: node.start_position().row + 1 }); }
+                    }
+                }
+                return;
             }
             _ => {}
         }

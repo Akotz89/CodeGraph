@@ -281,7 +281,7 @@ impl WorkspaceFilter {
         // Exact includes still have to be source files. The server's parser
         // registry is the authoritative extension list; the shared filter
         // keeps this list to text source formats supported by it.
-        if !ext.is_empty() && !config
+        if !ext.is_empty() && crate::parser_registry::source_template_kind(path).is_none() && !config
             .explicit_source_extensions
             .iter()
             .any(|known| known == ext)
@@ -1456,6 +1456,33 @@ mod tests {
         let g = graph.read().await;
         assert!(g.iter_nodes().any(|(_, n)| n.properties.get_string("name") == Some("Selected.Option")));
         assert!(!g.iter_nodes().any(|(_, n)| n.properties.get_string("name") == Some("Unlisted.Option")));
+    }
+
+    #[tokio::test]
+    async fn exact_source_templates_are_indexed_without_opening_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let shell = root.join("selected.sh.dist");
+        let header = root.join("selected.h.in");
+        let other_shell = root.join("other.sh.dist");
+        let other_header = root.join("other.h.in");
+        for p in [&shell, &other_shell] { std::fs::write(p, "function template_shell() { echo ok; }\n").unwrap(); }
+        for p in [&header, &other_header] { std::fs::write(p, "int template_header(void);\n").unwrap(); }
+        let parsers = Arc::new(ParserRegistry::new());
+        assert_eq!(parsers.language_for_path(&shell), Some("bash"));
+        assert_eq!(parsers.language_for_path(&header), Some("c"));
+        let state = Arc::new(Mutex::new(IndexState::for_workspace("template-test", &root)));
+        let indexer = Indexer::new(parsers.clone(), state.clone());
+        let mut config = IndexConfig::default();
+        config.explicit_source_files = vec![shell.clone(), header.clone()];
+        config.explicit_source_extensions = parsers.supported_extensions().iter().map(|s| s.trim_start_matches('.').to_string()).collect();
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        indexer.index_workspace(&graph, std::slice::from_ref(&root), &config).await;
+        let hashes = state.lock().await;
+        assert!(hashes.get_hash(&shell).is_some());
+        assert!(hashes.get_hash(&header).is_some());
+        assert!(hashes.get_hash(&other_shell).is_none());
+        assert!(hashes.get_hash(&other_header).is_none());
     }
 
     #[test]

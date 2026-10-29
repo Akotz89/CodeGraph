@@ -251,6 +251,10 @@ fn is_watchable(path: &Path, supported_extensions: &[String], filter: &Workspace
         return false;
     }
 
+    if crate::parser_registry::source_template_kind(path).is_some() {
+        return filter.is_explicit_file(path);
+    }
+
     // Check extension
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         if ext == "json" && path.file_name().is_some_and(|n| n == "package-lock.json" || n == "npm-shrinkwrap.json") { return false; }
@@ -791,6 +795,20 @@ mod tests {
         std::fs::remove_file(&script).unwrap();
         assert!(is_watchable(&script, &[], &filter));
         assert!(!is_watchable(&root.join("bin/other"), &[], &filter));
+    }
+
+    #[test]
+    fn selected_source_templates_remain_watchable_after_deletion() {
+        let tmp = tempfile::tempdir().unwrap(); let root = tmp.path();
+        let shell = root.join("selected.sh.dist"); let header = root.join("selected.h.in");
+        for p in [&shell, &header] { std::fs::write(p, "sample\n").unwrap(); }
+        let mut config = IndexConfig::default(); config.explicit_source_files = vec![shell.clone(), header.clone()];
+        let filter = WorkspaceFilter::new(&[root.to_path_buf()], &config);
+        assert!(is_watchable(&shell, &[], &filter)); assert!(is_watchable(&header, &[], &filter));
+        assert!(!is_watchable(&root.join("other.sh.dist"), &[], &filter));
+        assert!(!is_watchable(&root.join("other.h.in"), &[], &filter));
+        std::fs::remove_file(&shell).unwrap(); std::fs::remove_file(&header).unwrap();
+        assert!(is_watchable(&shell, &[], &filter)); assert!(is_watchable(&header, &[], &filter));
     }
 
     #[test]
