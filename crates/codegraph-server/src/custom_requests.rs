@@ -219,6 +219,7 @@ impl CodeGraphBackend {
     }
 
     async fn handle_index_files(&self, params: Value) -> Result<Value> {
+        self.indexer.refresh_mount_snapshot();
         // Accept both "files" (VS Code LM tools) and "paths" (MCP convention)
         let files: Vec<String> = params
             .get("files")

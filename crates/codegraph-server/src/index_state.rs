@@ -15,6 +15,9 @@ pub struct IndexState {
     slug: String,
     /// File content hashes: path → FNV-1a hash
     hashes: HashMap<PathBuf, u64>,
+    /// Optional volume identity, bound to the file hash it describes.
+    volumes: HashMap<PathBuf, (u64, String)>,
+    volumes_dirty: bool,
     /// Some when the workspace is ephemeral (test harness tempdir).
     /// Routes the state file to `<root>/.codegraph-state/index_state.json`
     /// instead of `~/.codegraph/projects/<slug>/` so we don't pollute
@@ -28,6 +31,8 @@ impl IndexState {
         Self {
             slug: slug.to_string(),
             hashes: HashMap::new(),
+            volumes: HashMap::new(),
+            volumes_dirty: false,
             ephemeral_root: None,
         }
     }
@@ -44,6 +49,8 @@ impl IndexState {
         Self {
             slug: slug.to_string(),
             hashes: HashMap::new(),
+            volumes: HashMap::new(),
+            volumes_dirty: false,
             ephemeral_root,
         }
     }
@@ -76,6 +83,7 @@ impl IndexState {
         let path = self.state_path();
         if self.invalidation_path().exists() {
             self.hashes.clear();
+            self.volumes.clear();
             tracing::warn!("Ignoring index state invalidated after graph persistence failure");
             return 0;
         }
@@ -93,8 +101,17 @@ impl IndexState {
         };
 
         self.hashes.clear();
+        self.volumes.clear();
+        self.volumes_dirty = false;
         for (path_str, hash) in &saved {
             self.hashes.insert(PathBuf::from(path_str), *hash);
+        }
+        if let Ok(json) = std::fs::read_to_string(path.with_extension("volumes.json")) {
+            if let Ok(volumes) = serde_json::from_str::<HashMap<PathBuf, (u64, String)>>(&json) {
+                self.volumes = volumes.into_iter().filter(|(path, (hash, _))| {
+                    self.hashes.get(path) == Some(hash)
+                }).collect();
+            }
         }
 
         tracing::info!(
@@ -109,6 +126,7 @@ impl IndexState {
     pub fn save(&self) -> bool {
         if self.hashes.is_empty() {
             let state_removed = self.remove_state_file();
+            let _ = std::fs::remove_file(self.state_path().with_extension("volumes.json"));
             let marker_removed = self.remove_invalidation_marker();
             return state_removed && marker_removed;
         }
@@ -123,6 +141,32 @@ impl IndexState {
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 tracing::warn!("Failed to create index state directory {:?}: {}", parent, e);
+                return false;
+            }
+        }
+
+        // Write volume metadata first. If the subsequent hash checkpoint fails,
+        // hash matching on load prevents the metadata from authorizing pruning.
+        let volume_path = path.with_extension("volumes.json");
+        let volume_temp = path.with_extension(format!("volumes.{}.{}.tmp", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos()).unwrap_or_default()));
+        let volumes = match serde_json::to_vec(&self.volumes) {
+            Ok(volumes) => volumes,
+            Err(error) => { tracing::warn!("Cannot serialize volume identities: {}", error); return false; }
+        };
+        if let Err(error) = std::fs::write(&volume_temp, volumes) {
+            let _ = std::fs::remove_file(&volume_temp);
+            tracing::warn!("Cannot save volume identities: {}", error);
+            return false;
+        }
+        if let Err(error) = std::fs::rename(&volume_temp, &volume_path) {
+            // On Windows rename cannot replace the old file. A missing sidecar
+            // is safe: loading will conservatively keep unknown missing paths.
+            if !volume_path.exists() || std::fs::remove_file(&volume_path).is_err()
+                || std::fs::rename(&volume_temp, &volume_path).is_err() {
+                let _ = std::fs::remove_file(&volume_temp);
+                tracing::warn!("Cannot replace volume identities: {}", error);
                 return false;
             }
         }
@@ -208,23 +252,46 @@ impl IndexState {
 
     /// Set the hash for a file path.
     pub fn set_hash(&mut self, path: PathBuf, hash: u64) {
+        if self.hashes.get(&path) != Some(&hash) { self.volumes.remove(&path); }
         self.hashes.insert(path, hash);
+    }
+
+    pub fn set_volume(&mut self, path: &Path, identity: String) {
+        if let Some(hash) = self.hashes.get(path) {
+            let value = (*hash, identity);
+            if self.volumes.get(path) != Some(&value) {
+                self.volumes.insert(path.to_path_buf(), value);
+                self.volumes_dirty = true;
+            }
+        }
+    }
+
+    pub fn volumes_dirty(&self) -> bool { self.volumes_dirty }
+
+    pub fn acknowledge_volumes_saved(&mut self) { self.volumes_dirty = false; }
+
+    pub fn volume(&self, path: &Path) -> Option<&str> {
+        self.volumes.get(path).and_then(|(hash, identity)|
+            (self.hashes.get(path) == Some(hash)).then_some(identity.as_str()))
     }
 
     /// Remove a file from the state.
     pub fn remove(&mut self, path: &Path) {
         self.hashes.remove(path);
+        self.volumes.remove(path);
     }
 
     /// Clear all hashes.
     pub fn clear(&mut self) {
         self.hashes.clear();
+        self.volumes.clear();
     }
 
     /// Clear in-memory hashes and remove the durable checkpoint after graph
     /// persistence fails, so the next run cannot trust a mismatched graph.
     pub fn invalidate_saved_state(&mut self) -> bool {
         self.hashes.clear();
+        self.volumes.clear();
         let path = self.state_path();
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -273,6 +340,23 @@ impl IndexState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volume_checkpoint_requires_matching_file_hash() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source.rs");
+        let mut state = IndexState::for_workspace("volume-test", workspace.path());
+        state.set_hash(source.clone(), 123);
+        state.set_volume(&source, "mount-a".into());
+        assert!(state.save());
+        let mut loaded = IndexState::for_workspace("volume-test", workspace.path());
+        assert_eq!(loaded.load(), 1);
+        assert_eq!(loaded.volume(&source), Some("mount-a"));
+        let changed = HashMap::from([(source.to_string_lossy().to_string(), 456_u64)]);
+        std::fs::write(loaded.state_path(), serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert_eq!(loaded.load(), 1);
+        assert_eq!(loaded.volume(&source), None);
+    }
 
     #[test]
     fn invalidating_state_removes_checkpoint_and_clears_hashes() {

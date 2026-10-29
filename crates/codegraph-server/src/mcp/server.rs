@@ -1181,6 +1181,7 @@ impl McpBackend {
     /// Also detects and re-indexes direct dependents (files that called or
     /// imported symbols from the updated files) to keep edges consistent.
     pub async fn add_files_to_index(&self, paths: &[PathBuf]) -> Result<(usize, usize), String> {
+        self.indexer.refresh_mount_snapshot();
         let filter = crate::indexer::WorkspaceFilter::new(&self.workspace_folders, &self.index_config());
         let mut indexed = 0;
         let mut failed = 0;

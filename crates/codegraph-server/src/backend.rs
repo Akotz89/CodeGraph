@@ -1317,7 +1317,7 @@ impl LanguageServer for CodeGraphBackend {
             }
 
             // Persist graph to RocksDB so next startup loads instantly
-            if result.files_parsed > 0 {
+            if result.files_parsed > 0 || result.files_removed > 0 || result.volume_metadata_changed {
                 let _phase = crate::crash_phase::enter("index_persist");
                 if let Some(first) = folders.first() {
                     let slug = crate::memory::project_slug(first);
@@ -2419,6 +2419,7 @@ impl LanguageServer for CodeGraphBackend {
             }
 
             "codegraph.indexFiles" => {
+                self.indexer.refresh_mount_snapshot();
                 let args = params.arguments.first().ok_or_else(|| {
                     tower_lsp::jsonrpc::Error::invalid_params("Missing arguments")
                 })?;
