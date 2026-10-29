@@ -773,6 +773,8 @@ impl IndexConfig {
 /// Result of an indexing run.
 #[derive(Debug, Clone, Default)]
 pub struct IndexResult {
+    /// Cross-file resolution failure; callers must not report or persist success.
+    pub resolution_error: Option<String>,
     /// Total files encountered (parsed + skipped).
     pub total_files: usize,
     /// Files that were actually parsed (new or changed).
@@ -794,9 +796,25 @@ pub struct IndexResult {
     pub parser_errors_by_language: std::collections::HashMap<String, usize>,
 }
 
+impl IndexResult {
+    /// Human-readable reason an indexing run cannot be committed as complete.
+    pub fn failure(&self) -> Option<String> {
+        let failed: usize = self.parser_errors_by_language.values().sum();
+        match (&self.resolution_error, failed) {
+            (Some(error), 0) => Some(format!("Cross-file resolution failed: {error}")),
+            (Some(error), n) => Some(format!("Cross-file resolution failed: {error}; failed to parse {n} file(s)")),
+            (None, 0) => None,
+            (None, n) => Some(format!("Failed to parse {n} file(s)")),
+        }
+    }
+}
+
 /// Shared indexer for walking directories, hashing files, and parsing them
 /// into a [`CodeGraph`].
 pub struct Indexer {
+    /// Serializes MCP watcher and explicit indexing batches with forced rebuilds.
+    pub(crate) mcp_operation_lock: Mutex<()>,
+    pub(crate) mcp_reindex_incomplete: Arc<std::sync::atomic::AtomicBool>,
     parsers: Arc<ParserRegistry>,
     index_state: Arc<Mutex<IndexState>>,
     mount_table: std::sync::RwLock<Option<Vec<(PathBuf, String, PathBuf)>>>,
@@ -1062,6 +1080,8 @@ impl Indexer {
     /// Create a new indexer backed by the given parser registry and index state.
     pub fn new(parsers: Arc<ParserRegistry>, index_state: Arc<Mutex<IndexState>>) -> Self {
         Self {
+            mcp_operation_lock: Mutex::new(()),
+            mcp_reindex_incomplete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             parsers,
             index_state,
             mount_table: std::sync::RwLock::new(current_mount_table()),
@@ -1169,7 +1189,10 @@ impl Indexer {
                         }
                         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    Err(error) => tracing::warn!("Failed to index explicit source file: {error}"),
+                    Err(error) => {
+                        tracing::warn!("Failed to index explicit source file: {error}");
+                        *result.parser_errors_by_language.entry("explicit-source".to_string()).or_default() += 1;
+                    },
                 }
             }
         }
@@ -1226,10 +1249,18 @@ impl Indexer {
         // the locks; the hash was removed so indexing cannot skip it as unchanged.
         result.files_parsed += self.reindex_reappeared(graph, folders, config, reappeared).await;
 
+        // Resolve even after parse failures so the in-memory graph does not
+        // retain relationships to removed nodes.
         // Resolve cross-file imports
         {
             let mut g = graph.write().await;
-            GraphUpdater::resolve_cross_file_imports(&mut g);
+            if let Err(error) = GraphUpdater::resolve_cross_file_imports(&mut g) {
+                result.resolution_error = Some(error.to_string());
+            }
+        }
+        if result.failure().is_some() {
+            self.invalidate_index_state().await;
+            return result;
         }
 
         // Detect runtime dependencies
@@ -1518,12 +1549,14 @@ impl Indexer {
             }
         }
 
-        // File is new or changed — remove old nodes and parse
+        // The old graph nodes are about to be removed. If parsing fails,
+        // a later return to the previous bytes must not skip reconstruction.
+        self.remove_file_hash(path).await;
         {
             let mut g = graph.write().await;
             let path_str = path.to_string_lossy().to_string();
             for old_id in g.nodes_by_path(&path_str) {
-                let _ = g.delete_node(old_id);
+                g.delete_node(old_id).map_err(|error| format!("Failed to remove old file nodes: {error}"))?;
             }
 
             match self.parsers.parse_file(path, &mut g) {
@@ -1546,6 +1579,27 @@ impl Indexer {
 mod tests {
     use super::*;
     use codegraph::{NamespacedBackend, NodeType, PropertyMap, RocksDBBackend};
+
+    #[tokio::test]
+    async fn failed_parse_cannot_leave_an_old_hash_that_skips_restoration() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let file = root.join("example.py");
+        let original = b"def restored_function():\n    return 1\n";
+        std::fs::write(&file, original).unwrap();
+        let parsers = Arc::new(ParserRegistry::new());
+        let state = Arc::new(Mutex::new(IndexState::for_workspace("parse-failure-test", &root)));
+        let indexer = Indexer::new(parsers, state.clone());
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        assert!(indexer.index_file(&graph, &file).await.unwrap());
+        std::fs::write(&file, [0xff]).unwrap();
+        assert!(indexer.index_file(&graph, &file).await.is_err());
+        assert!(state.lock().await.get_hash(&file).is_none());
+        std::fs::write(&file, original).unwrap();
+        assert!(indexer.index_file(&graph, &file).await.unwrap());
+        assert!(graph.read().await.iter_nodes().any(|(_, node)|
+            node.properties.get_string("name") == Some("restored_function")));
+    }
 
     #[test]
     fn missing_file_recreated_during_identity_check_is_not_pruned() {

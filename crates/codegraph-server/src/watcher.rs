@@ -175,6 +175,7 @@ impl FileWatcher {
                         graph,
                         memory_manager,
                         symbol_index,
+                        query_engine,
                         embed_queue,
                         &path,
                     )
@@ -217,6 +218,7 @@ impl FileWatcher {
 
         let path_str = path.to_string_lossy().to_string();
         let node_id_strings: Vec<String>;
+        let resolution;
 
         // Scope the graph lock
         {
@@ -227,13 +229,11 @@ impl FileWatcher {
 
             // Remove existing nodes for this file
             Self::remove_file_nodes(&mut graph, path)?;
-            GraphUpdater::resolve_sql_table_references(&mut graph);
-
             // Parse and add new nodes
             let file_info = parser.parse_source(&content, path, &mut graph)?;
 
             // Resolve cross-file imports after parsing
-            GraphUpdater::resolve_cross_file_imports(&mut graph);
+            resolution = GraphUpdater::resolve_cross_file_imports(&mut graph);
 
             // Keep the LSP symbol index (hover/goto) in sync with the graph.
             symbol_index.add_file(path.to_path_buf(), &file_info, &graph);
@@ -254,6 +254,7 @@ impl FileWatcher {
             }
         }
 
+        resolution?;
         Ok(())
     }
 
@@ -262,11 +263,13 @@ impl FileWatcher {
         graph: &Arc<RwLock<CodeGraph>>,
         memory_manager: &Arc<MemoryManager>,
         symbol_index: &Arc<SymbolIndex>,
+        query_engine: &Arc<QueryEngine>,
         embed_queue: &EmbedQueue,
         path: &Path,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let path_str = path.to_string_lossy().to_string();
         let node_id_strings: Vec<String>;
+        let resolution;
 
         // Scope the graph lock
         {
@@ -276,8 +279,10 @@ impl FileWatcher {
             node_id_strings = Self::collect_file_node_ids(&graph, path);
 
             Self::remove_file_nodes(&mut graph, path)?;
+            resolution = GraphUpdater::resolve_cross_file_imports(&mut graph);
         }
 
+        query_engine.build_indexes().await;
         // Drop the file's symbols from the hover index; queue a pass to prune
         // the now-orphaned vectors (update_file_vectors finds nothing to add).
         symbol_index.remove_file(path);
@@ -294,6 +299,7 @@ impl FileWatcher {
             }
         }
 
+        resolution?;
         Ok(())
     }
 
@@ -335,7 +341,7 @@ impl GraphUpdater {
         graph: &Arc<RwLock<CodeGraph>>,
         parsers: &Arc<ParserRegistry>,
         files: &[(PathBuf, String)],
-    ) -> BatchUpdateResult {
+    ) -> codegraph::Result<BatchUpdateResult> {
         let mut succeeded = Vec::new();
         let mut failed = Vec::new();
 
@@ -360,9 +366,9 @@ impl GraphUpdater {
         }
 
         // Post-process: resolve cross-file import edges to actual symbol nodes
-        Self::resolve_cross_file_imports(&mut graph_guard);
+        Self::resolve_cross_file_imports(&mut graph_guard)?;
 
-        BatchUpdateResult { succeeded, failed }
+        Ok(BatchUpdateResult { succeeded, failed })
     }
 
     /// Resolve import edges to actual symbol nodes across files.
@@ -375,61 +381,26 @@ impl GraphUpdater {
     ///
     /// This should be called after any parse operation to ensure cross-file
     /// imports are properly resolved.
-    pub fn resolve_cross_file_imports(graph: &mut CodeGraph) {
+    pub fn resolve_cross_file_imports(graph: &mut CodeGraph) -> codegraph::Result<()> {
         use codegraph::{EdgeType, NodeType, PropertyMap};
 
-        // Collect all file nodes and their import edges
-        let file_nodes: Vec<_> = graph
-            .query()
-            .node_type(NodeType::CodeFile)
-            .execute()
-            .unwrap_or_default();
-
-        // Build a map of symbol name -> node ID for quick lookup.
-        // When multiple symbols share a name (e.g. platform-specific stubs),
-        // prefer the non-stub version (higher complexity / more lines).
-        let mut symbol_map: std::collections::HashMap<String, codegraph::NodeId> =
-            std::collections::HashMap::new();
-
-        // Index all functions — prefer non-stub implementations over stubs
-        if let Ok(functions) = graph.query().node_type(NodeType::Function).execute() {
-            for func_id in functions {
-                if let Ok(node) = graph.get_node(func_id) {
-                    if let Some(name) = node.properties.get_string("name") {
-                        let name = name.to_string();
-                        if let Some(&existing_id) = symbol_map.get(&name) {
-                            // Prefer the version with higher complexity (non-stub)
-                            let existing_score = symbol_weight(graph, existing_id);
-                            let new_score = symbol_weight(graph, func_id);
-                            if new_score > existing_score {
-                                symbol_map.insert(name, func_id);
-                            }
-                        } else {
-                            symbol_map.insert(name, func_id);
-                        }
-                    }
+        // All nodes come from the in-memory graph iterator, avoiding silent
+        // fallback to an empty map when a query fails.
+        let file_nodes: Vec<_> = graph.iter_nodes().filter_map(|(id, node)|
+            (node.node_type == NodeType::CodeFile).then_some(id)).collect();
+        let mut symbol_map: std::collections::HashMap<String, codegraph::NodeId> = std::collections::HashMap::new();
+        for (id, node) in graph.iter_nodes().filter(|(_, node)| node.node_type == NodeType::Function) {
+            if let Some(name) = node.properties.get_string("name") {
+                match symbol_map.get(name) {
+                    Some(&existing) if symbol_weight(graph, id) <= symbol_weight(graph, existing) => {},
+                    _ => { symbol_map.insert(name.to_string(), id); }
                 }
             }
         }
-
-        // Index all classes
-        if let Ok(classes) = graph.query().node_type(NodeType::Class).execute() {
-            for class_id in classes {
-                if let Ok(node) = graph.get_node(class_id) {
-                    if let Some(name) = node.properties.get_string("name") {
-                        symbol_map.insert(name.to_string(), class_id);
-                    }
-                }
-            }
-        }
-
-        // Index all interfaces
-        if let Ok(interfaces) = graph.query().node_type(NodeType::Interface).execute() {
-            for interface_id in interfaces {
-                if let Ok(node) = graph.get_node(interface_id) {
-                    if let Some(name) = node.properties.get_string("name") {
-                        symbol_map.insert(name.to_string(), interface_id);
-                    }
+        for kind in [NodeType::Class, NodeType::Interface] {
+            for (id, node) in graph.iter_nodes().filter(|(_, node)| node.node_type == kind) {
+                if let Some(name) = node.properties.get_string("name") {
+                    symbol_map.insert(name.to_string(), id);
                 }
             }
         }
@@ -447,6 +418,7 @@ impl GraphUpdater {
             })
             .collect();
 
+        let mut desired_imports = HashSet::new();
         for (_, edge) in graph.iter_edges() {
             let file_id = edge.source_id;
             if edge.edge_type != EdgeType::Imports || !file_node_ids.contains(&file_id) {
@@ -456,6 +428,7 @@ impl GraphUpdater {
                 for symbol in &symbols {
                     let symbol = symbol.as_str();
                     if let Some(&symbol_id) = symbol_map.get(symbol) {
+                        desired_imports.insert((file_id, symbol_id));
                         if linked_pairs.insert((file_id, symbol_id)) {
                             let props = PropertyMap::new()
                                 .with("imported_symbol", symbol)
@@ -467,130 +440,108 @@ impl GraphUpdater {
             }
         }
 
-        // Add the resolved import edges
-        for (from_id, to_id, props) in edges_to_add {
-            let _ = graph.add_edge(from_id, to_id, EdgeType::Imports, props);
-        }
-
-        // Phase 2: Resolve cross-file calls
-        // Find all function nodes with unresolved_calls property and resolve them
-        let mut call_edges_to_add: Vec<(codegraph::NodeId, codegraph::NodeId, PropertyMap)> =
-            Vec::new();
-
-        if let Ok(functions) = graph.query().node_type(NodeType::Function).execute() {
-            for func_id in functions {
-                if let Ok(node) = graph.get_node(func_id) {
-                    if let Some(unresolved) =
-                        node.properties.get_string_list_compat("unresolved_calls")
-                    {
-                        for callee_name in &unresolved {
-                            let callee_name = callee_name.as_str();
-                            if !callee_name.is_empty() {
-                                if let Some(&callee_id) = symbol_map.get(callee_name) {
-                                    // Check if we already have a call edge
-                                    let already_linked = graph
-                                        .get_edges_between(func_id, callee_id)
-                                        .map(|edges| {
-                                            edges.iter().any(|e| {
-                                                graph
-                                                    .get_edge(*e)
-                                                    .map(|edge| edge.edge_type == EdgeType::Calls)
-                                                    .unwrap_or(false)
-                                            })
-                                        })
-                                        .unwrap_or(false);
-
-                                    if !already_linked {
-                                        let props = PropertyMap::new()
-                                            .with("resolved_by", "cross_file_resolution")
-                                            .with("is_direct", "true");
-                                        call_edges_to_add.push((func_id, callee_id, props));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Add the resolved call edges
+        // Remove only inferred calls whose selected target has changed. Keep
+        // parser-authored calls and avoid rewriting unchanged edges on rescans.
+        let desired_calls: HashSet<_> = graph.iter_nodes()
+            .filter(|(_, node)| node.node_type == NodeType::Function)
+            .flat_map(|(id, node)| {
+                node.properties.get_string_list_compat("unresolved_calls")
+                    .unwrap_or_default().into_iter()
+                    .filter(|name| !name.is_empty())
+                    .filter_map(|name| symbol_map.get(name.as_str()).copied().map(|target| (id, target)))
+                    .collect::<Vec<_>>()
+            }).collect();
+        let obsolete_calls: Vec<_> = graph.iter_edges().filter_map(|(id, edge)| {
+            (edge.edge_type == EdgeType::Calls
+                && edge.properties.get_string("resolved_by") == Some("cross_file_resolution")
+                && !desired_calls.contains(&(edge.source_id, edge.target_id)))
+                .then_some(id)
+        }).collect();
+        let existing_calls: HashSet<_> = graph.iter_edges()
+            .filter_map(|(_, edge)| (edge.edge_type == EdgeType::Calls)
+                .then_some((edge.source_id, edge.target_id)))
+            .collect();
+        let call_edges_to_add: Vec<_> = desired_calls.difference(&existing_calls)
+            .map(|&(from_id, to_id)| (from_id, to_id, EdgeType::Calls,
+                PropertyMap::new().with("resolved_by", "cross_file_resolution").with("is_direct", "true")))
+            .collect();
         let resolved_call_count = call_edges_to_add.len();
-        for (from_id, to_id, props) in call_edges_to_add {
-            let _ = graph.add_edge(from_id, to_id, EdgeType::Calls, props);
-        }
-
-        if resolved_call_count > 0 {
-            tracing::info!(
-                "[resolve_cross_file] Phase 2: resolved {} cross-file call edges",
-                resolved_call_count
-            );
-        }
-        tracing::info!("[resolve_cross_file] Phase 2 complete: call edges added");
-
-        // Phase 3: Resolve cross-file type references
-        // Find function/class nodes with unresolved_type_refs and create References edges
-        let mut ref_edges_to_add: Vec<(codegraph::NodeId, codegraph::NodeId, PropertyMap)> =
-            Vec::new();
-
-        if let Ok(functions) = graph.query().node_type(NodeType::Function).execute() {
-            for func_id in functions {
-                if let Ok(node) = graph.get_node(func_id) {
-                    if let Some(unresolved) = node
-                        .properties
-                        .get_string_list_compat("unresolved_type_refs")
-                    {
-                        for type_name in &unresolved {
-                            let type_name = type_name.as_str();
-                            if let Some(&type_id) = symbol_map.get(type_name) {
-                                let already_linked = graph
-                                    .get_edges_between(func_id, type_id)
-                                    .map(|edges| {
-                                        edges.iter().any(|e| {
-                                            graph
-                                                .get_edge(*e)
-                                                .map(|edge| edge.edge_type == EdgeType::References)
-                                                .unwrap_or(false)
-                                        })
-                                    })
-                                    .unwrap_or(false);
-
-                                if !already_linked {
-                                    let props = PropertyMap::new()
-                                        .with("resolved_by", "cross_file_resolution");
-                                    ref_edges_to_add.push((func_id, type_id, props));
-                                }
-                            }
+        // Resolve type references without mutating the graph while planning.
+        let mut existing_refs: HashSet<_> = graph.iter_edges().filter_map(|(_, edge)|
+            (edge.edge_type == EdgeType::References).then_some((edge.source_id, edge.target_id))).collect();
+        let mut ref_edges_to_add = Vec::new();
+        let mut desired_refs = HashSet::new();
+        for (func_id, node) in graph.iter_nodes().filter(|(_, node)| node.node_type == NodeType::Function) {
+            if let Some(unresolved) = node.properties.get_string_list_compat("unresolved_type_refs") {
+                for name in unresolved {
+                    if let Some(&type_id) = symbol_map.get(name.as_str()) {
+                        desired_refs.insert((func_id, type_id));
+                        if existing_refs.insert((func_id, type_id)) {
+                            ref_edges_to_add.push((func_id, type_id, EdgeType::References,
+                                PropertyMap::new().with("resolved_by", "cross_file_resolution")));
                         }
                     }
                 }
             }
         }
-
-        // Add the resolved type reference edges
-        for (from_id, to_id, props) in ref_edges_to_add {
-            let _ = graph.add_edge(from_id, to_id, EdgeType::References, props);
+        let scopes = Self::sql_scope_map();
+        let (sql_obsolete, sql_additions) = Self::plan_sql_table_references(graph, &scopes);
+        let mut obsolete = obsolete_calls;
+        obsolete.extend(graph.iter_edges().filter_map(|(id, edge)| {
+            if edge.properties.get_string("resolved_by") != Some("cross_file_resolution") {
+                return None;
+            }
+            let pair = (edge.source_id, edge.target_id);
+            match edge.edge_type {
+                EdgeType::Imports if !desired_imports.contains(&pair) => Some(id),
+                EdgeType::References if !desired_refs.contains(&pair) => Some(id),
+                _ => None,
+            }
+        }));
+        obsolete.extend(sql_obsolete);
+        let mut additions: Vec<_> = edges_to_add.into_iter()
+            .map(|(from, to, props)| (from, to, EdgeType::Imports, props)).collect();
+        additions.extend(call_edges_to_add);
+        additions.extend(ref_edges_to_add);
+        additions.extend(sql_additions);
+        graph.replace_edges_batch(&obsolete, additions)?;
+        if resolved_call_count > 0 {
+            tracing::info!("[resolve_cross_file] Resolved {} cross-file call edges", resolved_call_count);
         }
-
-        Self::resolve_sql_table_references(graph);
+        Ok(())
     }
 
     /// Link unqualified SQL references only within an unambiguous database scope.
-    pub fn resolve_sql_table_references(graph: &mut CodeGraph) {
-        let scopes: std::collections::HashMap<String, String> = match std::env::var("CODEGRAPH_SQL_SCOPE_MAP") {
+    pub fn resolve_sql_table_references(graph: &mut CodeGraph) -> codegraph::Result<()> {
+        let (obsolete, additions) = Self::plan_sql_table_references(graph, &Self::sql_scope_map());
+        graph.replace_edges_batch(&obsolete, additions)?;
+        Ok(())
+    }
+
+    fn sql_scope_map() -> std::collections::HashMap<String, String> {
+        match std::env::var("CODEGRAPH_SQL_SCOPE_MAP") {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|_| {
                 tracing::warn!("Invalid SQL scope map; cross-root links are disabled");
                 Default::default()
             }),
             Err(_) => Default::default(),
-        };
-        Self::resolve_sql_table_references_with_scopes(graph, &scopes);
+        }
     }
 
+    #[cfg(test)]
     fn resolve_sql_table_references_with_scopes(
         graph: &mut CodeGraph,
         scopes: &std::collections::HashMap<String, String>,
-    ) {
+    ) -> codegraph::Result<()> {
+        let (obsolete, additions) = Self::plan_sql_table_references(graph, scopes);
+        graph.replace_edges_batch(&obsolete, additions)?;
+        Ok(())
+    }
+
+    fn plan_sql_table_references(
+        graph: &CodeGraph,
+        scopes: &std::collections::HashMap<String, String>,
+    ) -> (Vec<codegraph::EdgeId>, Vec<(codegraph::NodeId, codegraph::NodeId, codegraph::EdgeType, codegraph::PropertyMap)>) {
         use codegraph::{EdgeType, NodeId, PropertyMap};
         use std::collections::HashMap;
 
@@ -616,15 +567,7 @@ impl GraphUpdater {
             Some((root.to_owned(), database.to_owned(), name, stage == "base"))
         }
 
-        let obsolete: Vec<_> = graph.iter_edges().filter_map(|(id, edge)| {
-            matches!(edge.properties.get_string("resolved_by"), Some("sql_database_scope" | "code_sql_literal" | "code_sql_prepared")).then_some(id)
-        }).collect();
-        for id in obsolete {
-            if let Err(error) = graph.delete_edge(id) {
-                tracing::error!("Failed to clear inferred SQL edge: {}", error);
-                return;
-            }
-        }
+        let mut additions = Vec::new();
 
         let mut definitions: HashMap<(String, String, String), Vec<NodeId>> = HashMap::new();
         let mut references = Vec::new();
@@ -642,10 +585,8 @@ impl GraphUpdater {
         }
         for (reference, key) in references {
             if let Some([definition]) = definitions.get(&key).map(Vec::as_slice) {
-                if let Err(error) = graph.add_edge(reference, *definition, EdgeType::References,
-                    PropertyMap::new().with("resolved_by", "sql_database_scope")) {
-                    tracing::error!("Failed to add inferred SQL edge: {}", error);
-                }
+                additions.push((reference, *definition, EdgeType::References,
+                    PropertyMap::new().with("resolved_by", "sql_database_scope")));
             }
         }
 
@@ -693,15 +634,24 @@ impl GraphUpdater {
             }
         }
         for (function, table) in &links {
-            if let Err(error) = graph.add_edge(*function, *table, EdgeType::References, PropertyMap::new().with("resolved_by", "code_sql_literal")) {
-                tracing::error!("Failed to add inferred code SQL edge: {}", error);
-            }
+            additions.push((*function, *table, EdgeType::References, PropertyMap::new().with("resolved_by", "code_sql_literal")));
         }
         for (function, table) in prepared_links.difference(&links) {
-            if let Err(error) = graph.add_edge(*function, *table, EdgeType::References, PropertyMap::new().with("resolved_by", "code_sql_prepared")) {
-                tracing::error!("Failed to add inferred prepared SQL edge: {}", error);
-            }
+            additions.push((*function, *table, EdgeType::References, PropertyMap::new().with("resolved_by", "code_sql_prepared")));
         }
+        let desired: HashSet<_> = additions.iter().map(|(source, target, _, props)|
+            (*source, *target, props.get_string("resolved_by").unwrap().to_owned())).collect();
+        let mut existing = HashSet::new();
+        let obsolete: Vec<_> = graph.iter_edges().filter_map(|(id, edge)| {
+            let method = edge.properties.get_string("resolved_by")?;
+            if !matches!(method, "sql_database_scope" | "code_sql_literal" | "code_sql_prepared") { return None; }
+            let key = (edge.source_id, edge.target_id, method.to_owned());
+            (!desired.contains(&key) || !existing.insert(key)).then_some(id)
+        }).collect();
+        additions.retain(|(source, target, _, props)| {
+            existing.insert((*source, *target, props.get_string("resolved_by").unwrap().to_owned()))
+        });
+        (obsolete, additions)
     }
 }
 
@@ -765,14 +715,14 @@ mod tests {
         let table = graph.add_node(NodeType::Generic, PropertyMap::new()
             .with("name", "mail").with("kind", "table")
             .with("path", "/repo/data/sql/base/db_characters/mail.sql")).unwrap();
-        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new());
+        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new()).unwrap();
         assert_eq!(graph.get_edges_between(function, table).unwrap().len(), 1);
-        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new());
+        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new()).unwrap();
         assert_eq!(graph.get_edges_between(function, table).unwrap().len(), 1);
         let duplicate = graph.add_node(NodeType::Generic, PropertyMap::new()
             .with("name", "mail").with("kind", "table")
             .with("path", "/repo/data/sql/base/db_world/mail.sql")).unwrap();
-        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new());
+        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new()).unwrap();
         assert!(graph.get_edges_between(function, table).unwrap().is_empty());
         assert!(graph.get_edges_between(function, duplicate).unwrap().is_empty());
     }
@@ -788,7 +738,7 @@ mod tests {
         let foreign = graph.add_node(NodeType::Generic, PropertyMap::new()
             .with("name", "other").with("kind", "table")
             .with("path", "/different/data/sql/base/db_characters/other.sql")).unwrap();
-        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new());
+        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new()).unwrap();
         assert!(graph.get_edges_between(function, local).unwrap().is_empty());
         assert!(graph.get_edges_between(function, foreign).unwrap().is_empty());
     }
@@ -802,12 +752,12 @@ mod tests {
         parser.parse_source(r#"void define() { PrepareStatement(DEL_MAIL, "DELETE FROM mail WHERE id = ?", 0); }"#, std::path::Path::new("/repo/src/database.cpp"), &mut graph).unwrap();
         let user = parser.parse_source(r#"void user() { auto s = db.GetPreparedStatement(DEL_MAIL); db.Execute(s); }"#, std::path::Path::new("/repo/src/user.cpp"), &mut graph).unwrap().functions[0];
         let table = graph.add_node(NodeType::Generic, PropertyMap::new().with("name", "mail").with("kind", "table").with("path", "/repo/data/sql/base/db_characters/mail.sql")).unwrap();
-        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new());
+        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new()).unwrap();
         assert_eq!(graph.get_edges_between(user, table).unwrap().len(), 1);
         let edge = graph.get_edges_between(user, table).unwrap()[0];
         assert_eq!(graph.get_edge(edge).unwrap().properties.get_string("resolved_by"), Some("code_sql_prepared"));
         parser.parse_source(r#"void other() { PrepareStatement(DEL_MAIL, dynamic_sql, 0); }"#, std::path::Path::new("/repo/src/other.cpp"), &mut graph).unwrap();
-        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new());
+        super::GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new()).unwrap();
         assert!(graph.get_edges_between(user, table).unwrap().is_empty());
     }
     use super::*;
@@ -833,9 +783,11 @@ mod tests {
         let hyphen_ref = node("table_reference", "/module/data/sql/db-world/updates/001.sql", "things");
         let direct_ref = node("table_reference", "/module/data/sql/db-world/update.sql", "things");
         let update_definition = node("table", "/module/data/sql/db-world/updates/002.sql", "things");
-        GraphUpdater::resolve_sql_table_references(&mut graph);
-        GraphUpdater::resolve_sql_table_references(&mut graph);
+        GraphUpdater::resolve_sql_table_references(&mut graph).unwrap();
+        let original = graph.get_edges_between(reference, world).unwrap();
+        GraphUpdater::resolve_sql_table_references(&mut graph).unwrap();
         let edges = graph.get_edges_between(reference, world).unwrap();
+        assert_eq!(edges, original, "unchanged SQL links retain their edge IDs");
         assert_eq!(edges.len(), 1);
         assert_eq!(graph.get_edge(edges[0]).unwrap().edge_type, EdgeType::References);
         assert!(graph.get_edges_between(reference, auth).unwrap().is_empty());
@@ -853,17 +805,17 @@ mod tests {
             ("/repo".to_string(), "project".to_string()),
             ("/other".to_string(), "project".to_string()),
         ]);
-        GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &scopes);
+        GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &scopes).unwrap();
         assert_eq!(graph.get_edges_between(other_root, world).unwrap().len(), 1);
         assert!(graph.get_edges_between(other_root, auth).unwrap().is_empty());
-        GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new());
+        GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &std::collections::HashMap::new()).unwrap();
         assert!(graph.get_edges_between(other_root, world).unwrap().is_empty());
         let duplicate = graph.add_node(NodeType::Generic, PropertyMap::new().with("kind", "table")
             .with("path", "/repo/data/sql/base/db_world/other.sql").with("name", "things")).unwrap();
-        GraphUpdater::resolve_sql_table_references(&mut graph);
+        GraphUpdater::resolve_sql_table_references(&mut graph).unwrap();
         assert!(graph.get_edges_between(reference, world).unwrap().is_empty());
         graph.delete_node(duplicate).unwrap();
-        GraphUpdater::resolve_sql_table_references(&mut graph);
+        GraphUpdater::resolve_sql_table_references(&mut graph).unwrap();
         assert_eq!(graph.get_edges_between(reference, world).unwrap().len(), 1);
     }
 
@@ -875,7 +827,7 @@ mod tests {
         let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
         let parsers = Arc::new(ParserRegistry::new());
         let files = vec![(PathBuf::from(path), content.to_string())];
-        let result = GraphUpdater::update_files(&graph, &parsers, &files).await;
+        let result = GraphUpdater::update_files(&graph, &parsers, &files).await.unwrap();
         result.succeeded.into_iter().next().unwrap().1
     }
 
@@ -987,7 +939,7 @@ mod tests {
             "def foo():\n    pass\n".to_string(),
         )];
 
-        let result = GraphUpdater::update_files(&graph, &parsers, &files).await;
+        let result = GraphUpdater::update_files(&graph, &parsers, &files).await.unwrap();
 
         assert!(result.all_succeeded());
         assert_eq!(result.succeeded.len(), 1);
@@ -1005,7 +957,7 @@ mod tests {
             (PathBuf::from("c.ts"), "function c() {}".to_string()),
         ];
 
-        let result = GraphUpdater::update_files(&graph, &parsers, &files).await;
+        let result = GraphUpdater::update_files(&graph, &parsers, &files).await.unwrap();
 
         assert!(result.all_succeeded());
         assert_eq!(result.succeeded.len(), 3);
@@ -1018,7 +970,7 @@ mod tests {
 
         let files = vec![(PathBuf::from("readme.txt"), "hello world".to_string())];
 
-        let result = GraphUpdater::update_files(&graph, &parsers, &files).await;
+        let result = GraphUpdater::update_files(&graph, &parsers, &files).await.unwrap();
 
         // Unsupported files are silently skipped, not considered failures
         assert!(result.all_succeeded());
@@ -1037,7 +989,7 @@ mod tests {
             (PathBuf::from("valid.rs"), "fn bar() {}".to_string()),
         ];
 
-        let result = GraphUpdater::update_files(&graph, &parsers, &files).await;
+        let result = GraphUpdater::update_files(&graph, &parsers, &files).await.unwrap();
 
         // Only parseable files are tracked
         assert!(result.all_succeeded());
@@ -1054,14 +1006,14 @@ mod tests {
             PathBuf::from("test.py"),
             "def old_function(): pass".to_string(),
         )];
-        GraphUpdater::update_files(&graph, &parsers, &files1).await;
+        GraphUpdater::update_files(&graph, &parsers, &files1).await.unwrap();
 
         // Second update with new content (should replace old)
         let files2 = vec![(
             PathBuf::from("test.py"),
             "def new_function(): pass".to_string(),
         )];
-        let result = GraphUpdater::update_files(&graph, &parsers, &files2).await;
+        let result = GraphUpdater::update_files(&graph, &parsers, &files2).await.unwrap();
 
         assert!(result.all_succeeded());
     }
@@ -1099,7 +1051,7 @@ mod tests {
             ),
         ];
 
-        let result = GraphUpdater::update_files(&graph, &parsers, &files).await;
+        let result = GraphUpdater::update_files(&graph, &parsers, &files).await.unwrap();
         assert!(result.all_succeeded());
 
         // Now check if the import edge was resolved correctly
@@ -1782,7 +1734,7 @@ void helper_func(int x) {
         );
 
         // --- Phase 2: resolve_cross_file_imports ---
-        GraphUpdater::resolve_cross_file_imports(&mut graph);
+        GraphUpdater::resolve_cross_file_imports(&mut graph).unwrap();
 
         let edge_count_after_batch = count_calls_edges_from(&graph, main_id);
         assert!(
@@ -1820,7 +1772,7 @@ void helper_func(int x) {
         let main_id_new = fi.functions[0];
 
         // 3c. resolve after re-parse
-        GraphUpdater::resolve_cross_file_imports(&mut graph);
+        GraphUpdater::resolve_cross_file_imports(&mut graph).unwrap();
 
         let helper_id_final = find_function_node(&graph, "helper_func");
         assert!(
@@ -1831,6 +1783,122 @@ void helper_func(int x) {
             has_calls_edge(&graph, main_id_new, helper_id_final.unwrap()),
             "Expected Calls edge main_func -> helper_func after did_open cycle"
         );
+    }
+
+    #[test]
+    fn inferred_calls_are_replaced_when_resolution_changes() {
+        use codegraph::{EdgeType, NodeType, PropertyMap};
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let caller = graph.add_node(NodeType::Function, PropertyMap::new()
+            .with("name", "caller").with("path", "/candidate/caller.cpp")
+            .with("language", "cpp").with("unresolved_calls", vec!["helper".to_string()])
+            .with("unresolved_type_refs", vec!["helper".to_string()])).unwrap();
+        let direct = graph.add_node(NodeType::Function, PropertyMap::new()
+            .with("name", "direct").with("path", "/candidate/caller.cpp").with("language", "cpp")).unwrap();
+        let first = graph.add_node(NodeType::Function, PropertyMap::new()
+            .with("name", "helper").with("path", "/candidate/helper.cpp").with("language", "cpp")).unwrap();
+        graph.add_edge(caller, direct, EdgeType::Calls, PropertyMap::new()).unwrap();
+        let file = graph.add_node(NodeType::CodeFile, PropertyMap::new().with("name", "file")).unwrap();
+        let placeholder = graph.add_node(NodeType::Module, PropertyMap::new().with("name", "module")).unwrap();
+        graph.add_edge(file, placeholder, EdgeType::Imports, PropertyMap::new()
+            .with("symbols", vec!["helper".to_string()])).unwrap();
+        GraphUpdater::resolve_cross_file_imports(&mut graph).unwrap();
+        assert!(has_calls_edge(&graph, caller, first));
+        assert_eq!(graph.get_edges_between(file, first).unwrap().len(), 1);
+        assert!(graph.get_edges_between(caller, first).unwrap().iter()
+            .any(|id| graph.get_edge(*id).unwrap().edge_type == EdgeType::References));
+        let initial_edges = graph.get_edges_between(caller, first).unwrap();
+        GraphUpdater::resolve_cross_file_imports(&mut graph).unwrap();
+        assert_eq!(graph.get_edges_between(caller, first).unwrap(), initial_edges);
+        let second = graph.add_node(NodeType::Function, PropertyMap::new()
+            .with("name", "helper").with("path", "/fixtures/helper.cpp")
+            .with("language", "cpp").with("complexity", 99_i64)).unwrap();
+        GraphUpdater::resolve_cross_file_imports(&mut graph).unwrap();
+        assert!(!has_calls_edge(&graph, caller, first));
+        assert!(graph.get_edges_between(caller, first).unwrap().is_empty());
+        assert!(graph.get_edges_between(file, first).unwrap().is_empty());
+        assert_eq!(graph.get_edges_between(file, second).unwrap().len(), 1);
+        assert!(graph.get_edges_between(caller, second).unwrap().iter()
+            .any(|id| graph.get_edge(*id).unwrap().edge_type == EdgeType::References));
+        assert!(has_calls_edge(&graph, caller, second));
+        assert!(has_calls_edge(&graph, caller, direct));
+        graph.delete_node(second).unwrap();
+        GraphUpdater::resolve_cross_file_imports(&mut graph).unwrap();
+        assert!(has_calls_edge(&graph, caller, first));
+        assert!(has_calls_edge(&graph, caller, direct));
+    }
+
+    #[test]
+    fn inferred_call_replacement_reports_failure_and_retries() {
+        use codegraph::{NodeType, PropertyMap, GraphError};
+        use codegraph::storage::{BatchOperation, KeyValue, MemoryBackend, StorageBackend};
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        struct FailingBatch { inner: MemoryBackend, fail: Arc<AtomicBool> }
+        impl StorageBackend for FailingBatch {
+            fn put(&mut self, k: &[u8], v: &[u8]) -> codegraph::Result<()> { self.inner.put(k, v) }
+            fn get(&self, k: &[u8]) -> codegraph::Result<Option<Vec<u8>>> { self.inner.get(k) }
+            fn delete(&mut self, k: &[u8]) -> codegraph::Result<()> { self.inner.delete(k) }
+            fn exists(&self, k: &[u8]) -> codegraph::Result<bool> { self.inner.exists(k) }
+            fn scan_prefix(&self, k: &[u8]) -> codegraph::Result<Vec<KeyValue>> { self.inner.scan_prefix(k) }
+            fn write_batch(&mut self, ops: Vec<BatchOperation>) -> codegraph::Result<()> {
+                if self.fail.load(Ordering::SeqCst) {
+                    return Err(GraphError::Storage { message: "injected failure".into(), source: None });
+                }
+                self.inner.write_batch(ops)
+            }
+            fn flush(&mut self) -> codegraph::Result<()> { self.inner.flush() }
+        }
+        let fail = Arc::new(AtomicBool::new(false));
+        let mut graph = CodeGraph::with_backend(Box::new(FailingBatch { inner: MemoryBackend::new(), fail: fail.clone() })).unwrap();
+        let caller = graph.add_node(NodeType::Function, PropertyMap::new().with("name", "caller")
+            .with("unresolved_calls", vec!["helper".to_string()])).unwrap();
+        let first = graph.add_node(NodeType::Function, PropertyMap::new().with("name", "helper")).unwrap();
+        GraphUpdater::resolve_cross_file_imports(&mut graph).unwrap();
+        assert!(has_calls_edge(&graph, caller, first));
+        let second = graph.add_node(NodeType::Function, PropertyMap::new().with("name", "helper")
+            .with("complexity", 99_i64)).unwrap();
+        let file = graph.add_node(NodeType::CodeFile, PropertyMap::new().with("name", "file")).unwrap();
+        let placeholder = graph.add_node(NodeType::Module, PropertyMap::new().with("name", "module")).unwrap();
+        let imported = graph.add_node(NodeType::Function, PropertyMap::new().with("name", "imported")).unwrap();
+        graph.add_edge(file, placeholder, codegraph::EdgeType::Imports,
+            PropertyMap::new().with("symbols", vec!["imported".to_string()])).unwrap();
+        fail.store(true, Ordering::SeqCst);
+        assert!(GraphUpdater::resolve_cross_file_imports(&mut graph).is_err());
+        assert!(has_calls_edge(&graph, caller, first));
+        assert!(!has_calls_edge(&graph, caller, second));
+        assert!(graph.get_edges_between(file, imported).unwrap().is_empty());
+        fail.store(false, Ordering::SeqCst);
+        GraphUpdater::resolve_cross_file_imports(&mut graph).unwrap();
+        assert!(!has_calls_edge(&graph, caller, first));
+        assert!(has_calls_edge(&graph, caller, second));
+        assert_eq!(graph.get_edges_between(file, imported).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lsp_file_removal_reresolves_calls_and_refreshes_query_index() {
+        use codegraph::{NodeType, PropertyMap};
+        let mut initial = CodeGraph::in_memory().unwrap();
+        let caller = initial.add_node(NodeType::Function, PropertyMap::new()
+            .with("name", "caller").with("path", "/candidate/caller.cpp")
+            .with("unresolved_calls", vec!["helper".to_string()])).unwrap();
+        let fallback = initial.add_node(NodeType::Function, PropertyMap::new()
+            .with("name", "helper").with("path", "/candidate/fallback.cpp")).unwrap();
+        let removed = initial.add_node(NodeType::Function, PropertyMap::new()
+            .with("name", "helper").with("path", "/candidate/removed.cpp")
+            .with("complexity", 99_i64)).unwrap();
+        GraphUpdater::resolve_cross_file_imports(&mut initial).unwrap();
+        assert!(has_calls_edge(&initial, caller, removed));
+        let graph = Arc::new(RwLock::new(initial));
+        let engine = Arc::new(QueryEngine::new(graph.clone()));
+        engine.build_indexes().await;
+        let memory = Arc::new(MemoryManager::new(None));
+        let symbols = Arc::new(SymbolIndex::new());
+        let queue = EmbedQueue::new(engine.clone());
+        FileWatcher::handle_file_remove(&graph, &memory, &symbols, &engine, &queue,
+            Path::new("/candidate/removed.cpp")).await.unwrap();
+        let calls = engine.get_callees(caller, 1).await;
+        assert!(calls.iter().any(|call| call.node_id == fallback));
+        assert!(!calls.iter().any(|call| call.node_id == removed));
     }
 
     fn find_function_node(graph: &CodeGraph, name: &str) -> Option<codegraph::NodeId> {

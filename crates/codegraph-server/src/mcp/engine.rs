@@ -109,7 +109,7 @@ mod imp {
     /// (issue #23). A per-workspace `OnceCell` makes the second attach wait for
     /// the first load instead, while a slow first index of one workspace still
     /// does not block attaches to others.
-    async fn get_or_load(engine: &Arc<Engine>, workspace: PathBuf) -> Arc<McpServer> {
+    async fn get_or_load(engine: &Arc<Engine>, workspace: PathBuf) -> Result<Arc<McpServer>, String> {
         let ws = workspace
             .canonicalize()
             .unwrap_or_else(|_| workspace.clone());
@@ -117,10 +117,10 @@ mod imp {
             let mut registry = engine.registry.lock().await;
             Arc::clone(registry.entry(ws.clone()).or_default())
         };
-        Arc::clone(slot.get_or_init(|| load_workspace(engine, ws)).await)
+        Ok(Arc::clone(slot.get_or_try_init(|| load_workspace(engine, ws)).await?))
     }
 
-    async fn load_workspace(engine: &Arc<Engine>, ws: PathBuf) -> Arc<McpServer> {
+    async fn load_workspace(engine: &Arc<Engine>, ws: PathBuf) -> Result<Arc<McpServer>, String> {
         tracing::info!("Engine: loading workspace {}", ws.display());
         let mut server = McpServer::new(
             vec![ws],
@@ -134,8 +134,8 @@ mod imp {
         if let Some(shared) = &engine.shared_engine {
             server.set_shared_engine(Arc::clone(shared)).await;
         }
-        server.ensure_indexed().await;
-        Arc::new(server)
+        server.ensure_indexed().await?;
+        Ok(Arc::new(server))
     }
 
     /// First line of a connection: an attach frame selects the workspace.
@@ -180,7 +180,7 @@ mod imp {
         let workspace = attach_ws
             .or_else(|| engine.cfg.seeds.first().cloned())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let server = get_or_load(engine, workspace).await;
+        let mut server = None;
 
         // If the first line was actually a request (no attach frame), dispatch it.
         let mut queued = pending;
@@ -202,7 +202,26 @@ mod imp {
                     continue;
                 }
             };
-            if let Some(resp) = server.handle_request_shared(req).await {
+            if server.is_none() {
+                match get_or_load(engine, workspace.clone()).await {
+                    Ok(loaded) => server = Some(loaded),
+                    Err(error) => {
+                        tracing::error!("Engine workspace indexing failed: {error}");
+                        if req.id.is_some() {
+                            let response = crate::mcp::JsonRpcResponse::error(
+                                req.id, crate::mcp::JsonRpcError::internal_error(error),
+                            );
+                            if let Ok(mut bytes) = serde_json::to_vec(&response) {
+                                bytes.push(b'\n');
+                                if write_half.write_all(&bytes).await.is_err() { break; }
+                                let _ = write_half.flush().await;
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+            if let Some(resp) = server.as_ref().unwrap().handle_request_shared(req).await {
                 match serde_json::to_vec(&resp) {
                     Ok(mut bytes) => {
                         bytes.push(b'\n');
@@ -490,6 +509,68 @@ mod imp {
     #[cfg(test)]
     mod lock_tests {
         use super::*;
+
+        #[tokio::test]
+        async fn failed_workspace_load_can_retry_after_file_repair() {
+            let temp = tempfile::tempdir().unwrap();
+            let workspace = temp.path().join("codegraph-harness-engine-retry");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let source = workspace.join("broken.py");
+            std::fs::write(&source, [0xff]).unwrap();
+            let engine = Arc::new(Engine {
+                cfg: EngineConfig {
+                    socket_path: temp.path().join("engine.sock"),
+                    embedding_model: EmbeddingBackend::default(),
+                    exclude_dirs: Vec::new(), max_files: 100,
+                    full_body_embedding: false, split_identifiers: false,
+                    graph_only: true, seeds: Vec::new(),
+                },
+                registry: Arc::new(Mutex::new(HashMap::new())),
+                shared_engine: None, active: AtomicUsize::new(0), idle_since: AtomicU64::new(0),
+            });
+            let (left, right) = tokio::join!(get_or_load(&engine, workspace.clone()), get_or_load(&engine, workspace.clone()));
+            assert!(left.err().unwrap().contains("Failed to parse"));
+            assert!(right.err().unwrap().contains("Failed to parse"));
+            std::fs::write(source, "def repaired():\n    pass\n").unwrap();
+            let first = get_or_load(&engine, workspace.clone()).await.unwrap();
+            let second = get_or_load(&engine, workspace).await.unwrap();
+            assert!(Arc::ptr_eq(&first, &second));
+        }
+
+        #[tokio::test]
+        async fn connection_reports_index_failure_and_recovers_on_next_request() {
+            let temp = tempfile::tempdir().unwrap();
+            let workspace = temp.path().join("codegraph-harness-engine-wire-retry");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let source = workspace.join("broken.py");
+            std::fs::write(&source, [0xff]).unwrap();
+            let engine = Arc::new(Engine {
+                cfg: EngineConfig {
+                    socket_path: temp.path().join("engine.sock"),
+                    embedding_model: EmbeddingBackend::default(),
+                    exclude_dirs: Vec::new(), max_files: 100,
+                    full_body_embedding: false, split_identifiers: false,
+                    graph_only: true, seeds: vec![workspace],
+                },
+                registry: Arc::new(Mutex::new(HashMap::new())),
+                shared_engine: None, active: AtomicUsize::new(0), idle_since: AtomicU64::new(0),
+            });
+            let (client, server) = UnixStream::pair().unwrap();
+            let task = tokio::spawn(async move { serve_conn(&engine, server).await });
+            let (read, mut write) = client.into_split();
+            let mut lines = BufReader::new(read).lines();
+            write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n").await.unwrap();
+            let failed: serde_json::Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(failed["id"], 1);
+            assert!(failed["error"]["message"].as_str().unwrap().contains("Failed to parse"));
+            std::fs::write(source, "def repaired():\n    pass\n").unwrap();
+            write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n").await.unwrap();
+            let recovered: serde_json::Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(recovered["id"], 2);
+            assert!(recovered.get("result").is_some());
+            drop(write);
+            task.await.unwrap();
+        }
 
         /// flock is per open file description, not per process, so a second
         /// open in the same process contends exactly as a second engine would.

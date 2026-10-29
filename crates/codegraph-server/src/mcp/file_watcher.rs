@@ -640,6 +640,11 @@ fn path_key(path: &Path) -> String {
 
 /// Process accumulated file changes: re-index changed files, remove deleted files.
 async fn process_changes(ctx: &WatcherCtx, changed: &[PathBuf], removed: &[PathBuf]) {
+    let _guard = ctx.indexer.mcp_operation_lock.lock().await;
+    if ctx.indexer.mcp_reindex_incomplete.load(std::sync::atomic::Ordering::Acquire) {
+        tracing::warn!("Skipping watcher batch while forced reindex is incomplete; a forced retry will scan all files");
+        return;
+    }
     ctx.indexer.refresh_mount_snapshot();
     tracing::info!(
         "[file-watcher] Processing {} changes ({} modified, {} deleted)",
@@ -745,11 +750,21 @@ async fn process_changes(ctx: &WatcherCtx, changed: &[PathBuf], removed: &[PathB
         return;
     }
     if graph_changed {
-        let mut graph = ctx.graph.write().await;
-        GraphUpdater::resolve_cross_file_imports(&mut graph);
+        let resolution = {
+            let mut graph = ctx.graph.write().await;
+            GraphUpdater::resolve_cross_file_imports(&mut graph)
+        };
+        ctx.query_engine.build_indexes().await;
+        if let Err(error) = resolution {
+            ctx.indexer.invalidate_index_state().await;
+            ctx.query_engine.prune_orphan_vectors().await;
+            let reembed: Vec<String> = changed.iter().chain(dependents.iter()).map(|p| path_key(p)).collect();
+            ctx.query_engine.update_files_vectors(&reembed).await;
+            tracing::error!("[file-watcher] Cross-file resolution failed: {error}");
+            return;
+        }
     }
     if graph_changed {
-        ctx.query_engine.build_indexes().await;
 
         // Deleting a file and re-parsing one both leave vectors behind for node IDs
         // that no longer exist. One prune after all of it covers both; the old

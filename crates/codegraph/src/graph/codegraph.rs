@@ -345,6 +345,57 @@ impl CodeGraph {
         Ok(())
     }
 
+    /// Atomically replace edges, leaving storage and adjacency unchanged on failure.
+    pub fn replace_edges_batch(
+        &mut self,
+        remove: &[EdgeId],
+        add: Vec<(NodeId, NodeId, EdgeType, PropertyMap)>,
+    ) -> Result<Vec<EdgeId>> {
+        let unique: HashSet<_> = remove.iter().copied().collect();
+        let mut removed = Vec::with_capacity(unique.len());
+        let mut operations = Vec::with_capacity(unique.len() + add.len());
+        for id in unique {
+            let edge = self.get_edge(id)?;
+            removed.push((id, edge.source_id, edge.target_id));
+            operations.push(crate::storage::BatchOperation::Delete {
+                key: format!("edge:{id}").into_bytes(),
+            });
+        }
+        for (source, target, _, _) in &add {
+            self.get_node(*source)?;
+            self.get_node(*target)?;
+        }
+        let mut added = Vec::with_capacity(add.len());
+        for (source, target, kind, properties) in add {
+            let id = self.next_edge_id();
+            let edge = Edge::new(id, source, target, kind, properties);
+            let value = serde_json::to_vec(&edge)
+                .map_err(|e| GraphError::serialization("Failed to serialize edge", Some(e)))?;
+            operations.push(crate::storage::BatchOperation::Put {
+                key: format!("edge:{id}").into_bytes(), value,
+            });
+            added.push(edge);
+        }
+        if operations.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.storage.write_batch(operations)?;
+        for (id, source, target) in removed {
+            if let Some(edges) = self.adjacency_out.get_mut(&source) { edges.remove(&id); }
+            if let Some(edges) = self.adjacency_in.get_mut(&target) { edges.remove(&id); }
+            self.edges.remove(&id);
+        }
+        let mut ids = Vec::with_capacity(added.len());
+        for edge in added {
+            let id = edge.id;
+            self.adjacency_out.entry(edge.source_id).or_default().insert(id);
+            self.adjacency_in.entry(edge.target_id).or_default().insert(id);
+            self.edges.insert(id, edge);
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
     /// Get all neighbor nodes connected by edges in the specified direction.
     ///
     /// # Parameters
@@ -1080,6 +1131,53 @@ mod persist_tests {
     use super::super::types::NodeType;
     use super::CodeGraph;
     use crate::storage::{MemoryBackend, StorageBackend};
+
+    #[test]
+    fn batch_edge_deletion_is_atomic_on_storage_failure() {
+        use super::super::types::{Direction, EdgeType};
+        use crate::error::{GraphError, Result};
+        use crate::storage::{BatchOperation, KeyValue};
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        struct FailingBatch { inner: MemoryBackend, fail: Arc<AtomicBool> }
+        impl StorageBackend for FailingBatch {
+            fn put(&mut self, k: &[u8], v: &[u8]) -> Result<()> { self.inner.put(k, v) }
+            fn get(&self, k: &[u8]) -> Result<Option<Vec<u8>>> { self.inner.get(k) }
+            fn delete(&mut self, k: &[u8]) -> Result<()> { self.inner.delete(k) }
+            fn exists(&self, k: &[u8]) -> Result<bool> { self.inner.exists(k) }
+            fn scan_prefix(&self, k: &[u8]) -> Result<Vec<KeyValue>> { self.inner.scan_prefix(k) }
+            fn write_batch(&mut self, ops: Vec<BatchOperation>) -> Result<()> {
+                if self.fail.load(Ordering::SeqCst) {
+                    return Err(GraphError::Storage { message: "injected failure".into(), source: None });
+                }
+                self.inner.write_batch(ops)
+            }
+            fn flush(&mut self) -> Result<()> { self.inner.flush() }
+        }
+        let inner = MemoryBackend::new();
+        let fail = Arc::new(AtomicBool::new(false));
+        let mut graph = CodeGraph::with_backend(Box::new(FailingBatch { inner: inner.clone(), fail: fail.clone() })).unwrap();
+        let a = graph.add_node(NodeType::Function, PropertyMap::new()).unwrap();
+        let b = graph.add_node(NodeType::Function, PropertyMap::new()).unwrap();
+        let c = graph.add_node(NodeType::Function, PropertyMap::new()).unwrap();
+        let first = graph.add_edge(a, b, EdgeType::Calls, PropertyMap::new()).unwrap();
+        let second = graph.add_edge(a, c, EdgeType::Calls, PropertyMap::new()).unwrap();
+        fail.store(true, Ordering::SeqCst);
+        assert!(graph.replace_edges_batch(&[first, second], vec![(b, c, EdgeType::Calls, PropertyMap::new())]).is_err());
+        assert!(graph.get_edge(first).is_ok() && graph.get_edge(second).is_ok());
+        assert_eq!(graph.get_neighbors(a, Direction::Outgoing).unwrap().len(), 2);
+        assert_eq!(graph.get_neighbors(b, Direction::Incoming).unwrap(), vec![a]);
+        assert_eq!(graph.get_neighbors(c, Direction::Incoming).unwrap(), vec![a]);
+        assert_eq!(inner.scan_prefix(b"edge:").unwrap().len(), 2);
+        fail.store(false, Ordering::SeqCst);
+        let added = graph.replace_edges_batch(&[first, first, second], vec![(b, c, EdgeType::Calls, PropertyMap::new())]).unwrap();
+        assert_eq!(added.len(), 1);
+        assert!(graph.get_edge(added[0]).is_ok());
+        assert!(graph.get_edge(first).is_err() && graph.get_edge(second).is_err());
+        assert!(graph.get_neighbors(a, Direction::Outgoing).unwrap().is_empty());
+        assert!(graph.get_neighbors(b, Direction::Incoming).unwrap().is_empty());
+        assert_eq!(graph.get_neighbors(c, Direction::Incoming).unwrap(), vec![b]);
+        assert_eq!(inner.scan_prefix(b"edge:").unwrap().len(), 1);
+    }
 
     /// persist_to must write a full snapshot, not append: nodes removed in memory
     /// (e.g. by a re-parse, which re-adds survivors with fresh ids) must have their

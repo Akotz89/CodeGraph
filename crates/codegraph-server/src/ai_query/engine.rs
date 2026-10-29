@@ -41,6 +41,8 @@ pub struct QueryEngine {
     callee_index: Arc<RwLock<HashMap<NodeId, Vec<NodeId>>>>,
     /// Shared vector engine for semantic embedding (set after memory init)
     vector_engine: Arc<RwLock<Option<Arc<VectorEngine>>>>,
+    /// Serializes graph replacement with embedding and checkpoint work.
+    vector_build_lock: tokio::sync::Mutex<()>,
     /// Symbol embeddings: NodeId -> 768-dim vector (Jina Code V2)
     symbol_vectors: Arc<RwLock<HashMap<NodeId, Vec<f32>>>>,
     /// Symbol text used for embedding (for rebuilding)
@@ -400,6 +402,7 @@ impl QueryEngine {
             caller_index: Arc::new(RwLock::new(HashMap::new())),
             callee_index: Arc::new(RwLock::new(HashMap::new())),
             vector_engine: Arc::new(RwLock::new(None)),
+            vector_build_lock: tokio::sync::Mutex::new(()),
             symbol_vectors: Arc::new(RwLock::new(HashMap::new())),
             symbol_texts: Arc::new(RwLock::new(HashMap::new())),
             full_body_embedding: std::sync::atomic::AtomicBool::new(true),
@@ -621,6 +624,29 @@ impl QueryEngine {
         *self.vector_engine.write().await = Some(engine);
     }
 
+    /// Drop vectors before replacing the graph: node IDs can be reused and
+    /// pruning by ID alone cannot detect vectors belonging to old nodes.
+    pub async fn clear_symbol_vectors(&self) {
+        let _guard = self.vector_build_lock.lock().await;
+        self.symbol_vectors.write().await.clear();
+        self.symbol_texts.write().await.clear();
+    }
+
+    /// Replace the graph only after in-flight embedding work has finished.
+    pub async fn reset_graph_and_vectors(&self) {
+        self.reset_graph_and_vectors_with_persisted(None).await.expect("Failed to reset graph");
+    }
+
+    pub async fn reset_graph_and_vectors_with_persisted(&self, slug: Option<&str>) -> std::result::Result<(), String> {
+        let replacement = CodeGraph::in_memory().map_err(|e| format!("Failed to create graph: {e}"))?;
+        let _guard = self.vector_build_lock.lock().await;
+        if let Some(slug) = slug { Self::invalidate_persisted_vectors(slug)?; }
+        self.symbol_vectors.write().await.clear();
+        self.symbol_texts.write().await.clear();
+        *self.graph.write().await = replacement;
+        Ok(())
+    }
+
     /// Build symbol embedding vectors for semantic search.
     /// Requires vector_engine to be set first. Embeds name + signature + docstring
     /// for each symbol in batch for efficiency.
@@ -639,6 +665,7 @@ impl QueryEngine {
     ///   [`EMBED_LOW_MEM_MB`] it halves the ONNX batch and forces a
     ///   checkpoint — degrade to slow instead of being OOM-killed.
     pub async fn build_symbol_vectors_checkpointed(&self, slug: Option<&str>) {
+        let _guard = self.vector_build_lock.lock().await;
         let engine = match self.vector_engine.read().await.clone() {
             Some(e) => e,
             None => {
@@ -834,6 +861,7 @@ impl QueryEngine {
     /// path after a crash-interrupted embed run: persisted checkpoint vectors
     /// load on startup and this fills in only the remainder.
     pub async fn embed_missing_symbols_checkpointed(&self, slug: Option<&str>) {
+        let _guard = self.vector_build_lock.lock().await;
         let engine = match self.vector_engine.read().await.clone() {
             Some(e) => e,
             None => return,
@@ -1003,6 +1031,16 @@ impl QueryEngine {
         let mut namespaced = NamespacedBackend::new(Box::new(rocks), slug);
 
         claim_project(&mut namespaced, slug, stamp)
+    }
+
+    /// Invalidate persisted vectors before a graph replacement can reuse IDs.
+    /// Refuses to take a set owned by another live daemon.
+    pub fn invalidate_persisted_vectors(slug: &str) -> std::result::Result<(), String> {
+        if Self::claim_vector_set(slug, "invalidated:graph-replaced")? {
+            Ok(())
+        } else {
+            Err("A live daemon owns the persisted vector set".to_string())
+        }
     }
 
     /// The embed-text id this engine's vectors carry, or `None` before a vector
@@ -1185,6 +1223,7 @@ impl QueryEngine {
     /// the per-event costs behind issue #23. This walks the graph once and
     /// embeds everything that matched in one batch.
     pub async fn update_files_vectors(&self, file_paths: &[String]) {
+        let _guard = self.vector_build_lock.lock().await;
         if file_paths.is_empty() {
             return;
         }
@@ -3051,6 +3090,39 @@ mod tests {
         ));
         let engine = QueryEngine::new(Arc::clone(&graph));
         (engine, graph)
+    }
+
+    #[tokio::test]
+    async fn graph_reset_waits_for_embedding_work_before_reusing_ids() {
+        let (engine, graph) = create_test_engine().await;
+        let engine = Arc::new(engine);
+        let old_id = graph.write().await.add_node(NodeType::Function, PropertyMap::new().with("name", "old")).unwrap();
+        let embedding_guard = engine.vector_build_lock.lock().await;
+        let worker = Arc::clone(&engine);
+        let reset = tokio::spawn(async move { worker.reset_graph_and_vectors().await });
+        tokio::task::yield_now().await;
+        assert!(!reset.is_finished());
+        assert!(graph.read().await.get_node(old_id).is_ok());
+        engine.symbol_vectors.write().await.insert(old_id, vec![1.0]);
+        drop(embedding_guard);
+        reset.await.unwrap();
+        assert!(graph.read().await.get_node(old_id).is_err());
+        assert!(engine.symbol_vectors.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clearing_vectors_prevents_reused_node_ids_from_inheriting_old_embeddings() {
+        let (engine, graph) = create_test_engine().await;
+        let old_id = graph.write().await.add_node(NodeType::Function, PropertyMap::new().with("name", "old")).unwrap();
+        engine.symbol_vectors.write().await.insert(old_id, vec![1.0, 0.0]);
+        engine.symbol_texts.write().await.insert(old_id, "old".to_string());
+        engine.clear_symbol_vectors().await;
+        let mut replacement = CodeGraph::in_memory().unwrap();
+        let new_id = replacement.add_node(NodeType::Function, PropertyMap::new().with("name", "new")).unwrap();
+        assert_eq!(old_id, new_id);
+        *graph.write().await = replacement;
+        assert!(!engine.symbol_vectors.read().await.contains_key(&new_id));
+        assert!(!engine.symbol_texts.read().await.contains_key(&new_id));
     }
 
     #[test]

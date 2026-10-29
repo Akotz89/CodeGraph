@@ -127,6 +127,8 @@ pub struct McpBackend {
     /// Whether the most recent workspace index snapshot reached shared graph
     /// storage. Read by forced reindex tools to avoid reporting false success.
     last_graph_persist_succeeded: Arc<std::sync::atomic::AtomicBool>,
+    forced_reindex_incomplete: Arc<std::sync::atomic::AtomicBool>,
+    reindex_lock: Arc<tokio::sync::Mutex<()>>,
     /// Skip embedding generation — graph + structural tools only.
     /// For CI / one-shot runs where semantic search isn't needed.
     /// Avoids loading the ~100MB ONNX model entirely.
@@ -284,6 +286,7 @@ impl McpBackend {
         let parsers = Arc::new(ParserRegistry::new());
         let index_state = Arc::new(Mutex::new(IndexState::for_workspace(&slug, primary)));
         let indexer = Arc::new(Indexer::new(Arc::clone(&parsers), Arc::clone(&index_state)));
+        let forced_reindex_incomplete = Arc::clone(&indexer.mcp_reindex_incomplete);
 
         Self {
             query_engine: Arc::new(query_engine),
@@ -299,6 +302,8 @@ impl McpBackend {
             indexer,
             index_state,
             last_graph_persist_succeeded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            forced_reindex_incomplete,
+            reindex_lock: Arc::new(tokio::sync::Mutex::new(())),
             graph_only: false,
         }
     }
@@ -1036,7 +1041,11 @@ impl McpBackend {
     }
 
     /// Index the workspace. Returns (total_files, files_actually_parsed).
-    pub async fn index_workspace(&self) -> (usize, usize) {
+    pub async fn index_workspace(&self) -> Result<(usize, usize), String> {
+        self.index_workspace_with_fresh_vectors(false).await
+    }
+
+    async fn index_workspace_with_fresh_vectors(&self, force_fresh_vectors: bool) -> Result<(usize, usize), String> {
         let config = self.index_config();
 
         // Initialising the memory manager loads the embedding model, which is
@@ -1059,6 +1068,12 @@ impl McpBackend {
             .indexer
             .index_workspace(&self.graph, &self.workspace_folders, &config)
             .await;
+        if let Some(error) = result.failure() {
+            self.query_engine.build_indexes().await;
+            self.query_engine.prune_orphan_vectors().await;
+            self.last_graph_persist_succeeded.store(false, std::sync::atomic::Ordering::Release);
+            return Err(error);
+        }
 
         // Persist graph to shared database
         let persist_result = {
@@ -1086,10 +1101,12 @@ impl McpBackend {
                 self.query_engine.set_vector_engine(engine).await;
 
                 // Load persisted vectors synchronously (fast — just reads from RocksDB)
-                let load = self
-                    .query_engine
-                    .load_symbol_vectors(&self.project_slug)
-                    .await;
+                let load = if force_fresh_vectors {
+                    // Reset invalidated the old set before node IDs were reused.
+                    crate::ai_query::VectorLoad::Absent
+                } else {
+                    self.query_engine.load_symbol_vectors(&self.project_slug).await
+                };
                 // An unreadable store says nothing about what it holds - graph.db is
                 // one RocksDB shared by every project, and a lock held elsewhere reads
                 // exactly like this. Rebuilding with a slug claims the project, which
@@ -1103,7 +1120,13 @@ impl McpBackend {
                         self.project_slug
                     );
                 }
-                let loaded = load.count();
+                let loaded = if force_fresh_vectors {
+                    // The graph was replaced and node IDs may have been reused.
+                    self.query_engine.clear_symbol_vectors().await;
+                    0
+                } else {
+                    load.count()
+                };
 
                 if loaded > 0 && result.files_parsed == 0 {
                     tracing::info!(
@@ -1173,7 +1196,7 @@ impl McpBackend {
             tracing::info!("No files changed and no persisted data — skipping index rebuild");
         }
 
-        (result.total_files, result.files_parsed)
+        Ok((result.total_files, result.files_parsed))
     }
 
     /// Add or update specific files in the index without full reindex.
@@ -1181,6 +1204,10 @@ impl McpBackend {
     /// Also detects and re-indexes direct dependents (files that called or
     /// imported symbols from the updated files) to keep edges consistent.
     pub async fn add_files_to_index(&self, paths: &[PathBuf]) -> Result<(usize, usize), String> {
+        let _guard = self.indexer.mcp_operation_lock.lock().await;
+        if self.forced_reindex_incomplete.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("Workspace reindex is incomplete; retry a forced reindex".to_string());
+        }
         self.indexer.refresh_mount_snapshot();
         let filter = crate::indexer::WorkspaceFilter::new(&self.workspace_folders, &self.index_config());
         let mut indexed = 0;
@@ -1307,12 +1334,16 @@ impl McpBackend {
 
         if indexed > 0 || graph_changed {
             // Resolve cross-file imports across all files
-            {
+            let resolution = {
                 let mut graph = self.graph.write().await;
-                crate::watcher::GraphUpdater::resolve_cross_file_imports(&mut graph);
-            }
-            // Rebuild query indexes
+                crate::watcher::GraphUpdater::resolve_cross_file_imports(&mut graph)
+            };
+            // Keep queries consistent with the current graph, even on failure.
             self.query_engine.build_indexes().await;
+            if let Err(error) = resolution {
+                self.indexer.invalidate_index_state().await;
+                return Err(format!("Cross-file resolution failed: {error}"));
+            }
             self.query_engine.prune_orphan_vectors().await;
             // Incrementally re-embed updated symbols
             for path in paths.iter().chain(dependent_files.iter()) {
@@ -1335,6 +1366,10 @@ impl McpBackend {
         dir: &std::path::Path,
         embed: bool,
     ) -> Result<usize, String> {
+        let _guard = self.indexer.mcp_operation_lock.lock().await;
+        if self.forced_reindex_incomplete.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("Workspace reindex is incomplete; retry a forced reindex".to_string());
+        }
         if !dir.exists() || !dir.is_dir() {
             tracing::warn!("Directory not found: {:?}", dir);
             return Ok(0);
@@ -1342,20 +1377,28 @@ impl McpBackend {
 
         let config = self.index_config();
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (total, _parsed, _skipped, _by_lang, _errors) = self
+        let (total, _parsed, _skipped, _by_lang, errors) = self
             .indexer
             .index_directory(&self.graph, dir, &config, 0, counter)
             .await;
-
-        if total > 0 {
+        let failed: usize = errors.values().sum();
+        if total > 0 || failed > 0 {
             // Resolve cross-file imports
-            {
+            let resolution = {
                 let mut graph = self.graph.write().await;
-                crate::watcher::GraphUpdater::resolve_cross_file_imports(&mut graph);
-            }
-            // Rebuild indexes
+                crate::watcher::GraphUpdater::resolve_cross_file_imports(&mut graph)
+            };
             self.query_engine.build_indexes().await;
+            if let Err(error) = resolution {
+                self.indexer.invalidate_index_state().await;
+                return Err(format!("Cross-file resolution failed: {error}"));
+            }
 
+            if failed > 0 {
+                self.query_engine.prune_orphan_vectors().await;
+                self.indexer.invalidate_index_state().await;
+                return Err(format!("Failed to index {failed} file(s)"));
+            }
             if embed {
                 tracing::info!("Embedding symbols from {:?}...", dir);
                 self.query_engine.build_symbol_vectors().await;
@@ -1379,6 +1422,7 @@ pub struct McpServer {
     backend: McpBackend,
     initialized: bool,
     indexed: bool,
+    index_error: Option<String>,
     /// Whether this server keeps a filesystem watcher after indexing.
     watch_workspace: bool,
     /// Filesystem watcher for auto-indexing on file changes
@@ -1511,6 +1555,7 @@ impl McpServer {
             },
             initialized: false,
             indexed: false,
+            index_error: None,
             watch_workspace: true,
             _file_watcher: None,
             pro_provider,
@@ -1582,7 +1627,7 @@ impl McpServer {
             // ensure_indexed avoids first hashing/parsing stale workspace data.
             self.indexed = true;
         } else {
-            self.ensure_indexed().await;
+            self.ensure_indexed().await?;
         }
         self.execute_tool(tool_name, tool_args).await
     }
@@ -1598,11 +1643,10 @@ impl McpServer {
 
     /// Ensure workspace is indexed (lazy — runs on first tool call, or once at
     /// engine startup before serving connections).
-    pub(crate) async fn ensure_indexed(&mut self) {
+    pub(crate) async fn ensure_indexed(&mut self) -> Result<(), String> {
         if self.indexed {
-            return;
+            return Ok(());
         }
-        self.indexed = true;
 
         // If a watcher daemon already owns this workspace, its periodic persist
         // keeps graph.db warm. Build the in-memory query indexes from the graph
@@ -1683,7 +1727,9 @@ impl McpServer {
                     }
                 }
             }
-            return;
+            self.indexed = true;
+            self.index_error = None;
+            return Ok(());
         }
 
         // Load saved index state from previous session for incremental indexing
@@ -1693,13 +1739,23 @@ impl McpServer {
         }
 
         tracing::info!("Indexing workspace: {:?}", self.backend.workspace_folders);
-        let (total, parsed) = self.backend.index_workspace().await;
+        let (total, parsed) = match self.backend.index_workspace().await {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::error!("Workspace indexing failed: {error}");
+                self.index_error = Some(error.clone());
+                return Err(error);
+            }
+        };
         tracing::info!(
             "Indexed {} files ({} parsed, {} skipped)",
             total,
             parsed,
             total - parsed
         );
+
+        self.indexed = true;
+        self.index_error = None;
 
         // Start filesystem watcher for auto-indexing on file changes
         if self.watch_workspace && self._file_watcher.is_none() {
@@ -1725,6 +1781,7 @@ impl McpServer {
                 }
             }
         }
+        Ok(())
     }
 
     /// Run the MCP server event loop
@@ -1967,7 +2024,9 @@ impl McpServer {
         id: Option<Value>,
         params: Option<Value>,
     ) -> JsonRpcResponse {
-        self.ensure_indexed().await;
+        if let Err(error) = self.ensure_indexed().await {
+            return JsonRpcResponse::error(id, JsonRpcError::internal_error(error));
+        }
         self.tools_call_response(id, params).await
     }
 
@@ -1980,6 +2039,11 @@ impl McpServer {
         id: Option<Value>,
         params: Option<Value>,
     ) -> JsonRpcResponse {
+        if !self.indexed {
+            return JsonRpcResponse::error(id, JsonRpcError::internal_error(
+                self.index_error.as_deref().unwrap_or("Workspace is not indexed"),
+            ));
+        }
         let params: ToolCallParams = match params {
             Some(p) => match serde_json::from_value(p) {
                 Ok(p) => p,
@@ -2076,6 +2140,11 @@ impl McpServer {
     /// Execute a tool by name - delegates to query engine and other components
     async fn execute_tool(&self, name: &str, args: Option<Value>) -> Result<Value, String> {
         let args = args.unwrap_or(Value::Object(serde_json::Map::new()));
+        if self.backend.forced_reindex_incomplete.load(std::sync::atomic::Ordering::Acquire)
+            && !(name == "codegraph_reindex_workspace" && args.get("force").and_then(Value::as_bool) == Some(true))
+        {
+            return Err("Workspace reindex is incomplete; repair the error and retry codegraph_reindex_workspace with force=true".to_string());
+        }
 
         // Degradation warning: if the graph has very few nodes, the workspace
         // probably isn't indexed. Add a warning to the response so the agent
@@ -3662,14 +3731,23 @@ impl McpServer {
             // ==================== Admin Tools ====================
             "codegraph_reindex_workspace" => {
                 let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+                let _reindex_guard = self.backend.reindex_lock.lock().await;
+                let _operation_guard = self.backend.indexer.mcp_operation_lock.lock().await;
+                if !force && self.backend.forced_reindex_incomplete.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err("Workspace reindex is incomplete; retry a forced reindex".to_string());
+                }
                 tracing::info!("Reindexing workspace (force={})...", force);
 
                 if force {
-                    // Force: clear graph and hash cache for full rebuild
-                    {
-                        let mut graph = self.backend.graph.write().await;
-                        *graph = codegraph::CodeGraph::in_memory()
-                            .map_err(|e| format!("Failed to create new graph: {}", e))?;
+                    let was_incomplete = self.backend.forced_reindex_incomplete.swap(true, std::sync::atomic::Ordering::AcqRel);
+                    // Invalidate the durable set before changing graph IDs, even
+                    // in graph-only mode. Ephemeral test workspaces do not persist.
+                    let persisted_slug = (!self.backend.workspace_folders.first().is_some_and(|p| memory::is_ephemeral_workspace(p)))
+                        .then_some(self.backend.project_slug.as_str());
+                    // Serialize invalidation and replacement with embedding work.
+                    if let Err(error) = self.backend.query_engine.reset_graph_and_vectors_with_persisted(persisted_slug).await {
+                        self.backend.forced_reindex_incomplete.store(was_incomplete, std::sync::atomic::Ordering::Release);
+                        return Err(error);
                     }
                     self.backend
                         .index_state
@@ -3680,7 +3758,7 @@ impl McpServer {
                 // else: incremental — index_file skips unchanged files via hash cache
 
                 // Reindex the workspace
-                let (total, parsed) = self.backend.index_workspace().await;
+                let (total, parsed) = self.backend.index_workspace_with_fresh_vectors(force).await?;
                 tracing::info!(
                     "Reindexed: {} total, {} parsed, {} skipped",
                     total,
@@ -3712,6 +3790,9 @@ impl McpServer {
                     }
                 }
 
+                if force {
+                    self.backend.forced_reindex_incomplete.store(false, std::sync::atomic::Ordering::Release);
+                }
                 Ok(serde_json::json!({
                     "status": "success",
                     "message": format!("Reindexed {} files ({} changed, {} skipped)", total, parsed, total - parsed),
@@ -5290,6 +5371,152 @@ mod node_id_tests {
 mod quarantine_tests {
     use super::{should_watch_workspace, McpBackend, McpServer};
     use crate::index_state::IndexState;
+
+    #[tokio::test]
+    async fn workspace_index_reports_resolution_failure_and_invalidates_hashes() {
+        use codegraph::{CodeGraph, GraphError, NodeType, PropertyMap};
+        use codegraph::storage::{BatchOperation, KeyValue, MemoryBackend, StorageBackend};
+        struct FailingBatch(MemoryBackend);
+        impl StorageBackend for FailingBatch {
+            fn put(&mut self, k: &[u8], v: &[u8]) -> codegraph::Result<()> { self.0.put(k, v) }
+            fn get(&self, k: &[u8]) -> codegraph::Result<Option<Vec<u8>>> { self.0.get(k) }
+            fn delete(&mut self, k: &[u8]) -> codegraph::Result<()> { self.0.delete(k) }
+            fn exists(&self, k: &[u8]) -> codegraph::Result<bool> { self.0.exists(k) }
+            fn scan_prefix(&self, k: &[u8]) -> codegraph::Result<Vec<KeyValue>> { self.0.scan_prefix(k) }
+            fn write_batch(&mut self, _: Vec<BatchOperation>) -> codegraph::Result<()> {
+                Err(GraphError::Storage { message: "injected batch failure".into(), source: None })
+            }
+            fn flush(&mut self) -> codegraph::Result<()> { self.0.flush() }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("codegraph-harness-resolution-failure");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut backend = McpBackend::new_fresh(vec![workspace.clone()], Vec::new(), 100,
+            codegraph_memory::EmbeddingBackend::default(), false);
+        backend.graph_only = true;
+        let mut graph = CodeGraph::with_backend(Box::new(FailingBatch(MemoryBackend::new()))).unwrap();
+        graph.add_node(NodeType::Function, PropertyMap::new().with("name", "caller")
+            .with("unresolved_calls", vec!["helper".to_string()])).unwrap();
+        graph.add_node(NodeType::Function, PropertyMap::new().with("name", "helper")).unwrap();
+        *backend.graph.write().await = graph;
+        let marker = workspace.join("previous.py");
+        backend.index_state.lock().await.set_hash(marker.clone(), 123);
+        let error = backend.index_workspace().await.unwrap_err();
+        assert!(error.contains("Cross-file resolution failed"));
+        assert!(backend.index_state.lock().await.get_hash(&marker).is_none());
+        assert!(!backend.last_graph_persist_succeeded.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn workspace_index_reports_parse_failure_without_persisting_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("codegraph-harness-parse-failure");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("broken.py"), [0xff]).unwrap();
+        let mut backend = McpBackend::new_fresh(vec![workspace], Vec::new(), 100,
+            codegraph_memory::EmbeddingBackend::default(), false);
+        backend.graph_only = true;
+        let error = backend.index_workspace().await.unwrap_err();
+        assert!(error.contains("Failed to parse"));
+        assert!(!backend.last_graph_persist_succeeded.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn queued_incremental_reindex_rechecks_failure_after_waiting() {
+        use std::sync::Arc;
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("codegraph-harness-queued-reindex");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let server = Arc::new(McpServer::new_fresh(vec![workspace], Vec::new(), 100,
+            codegraph_memory::EmbeddingBackend::default(), false).with_graph_only(true));
+        let lock = server.backend.reindex_lock.lock().await;
+        let other = Arc::clone(&server);
+        let task = tokio::spawn(async move {
+            other.execute_tool("codegraph_reindex_workspace", Some(serde_json::json!({"force": false}))).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        server.backend.forced_reindex_incomplete.store(true, std::sync::atomic::Ordering::Release);
+        drop(lock);
+        assert!(task.await.unwrap().unwrap_err().contains("reindex is incomplete"));
+    }
+
+    #[tokio::test]
+    async fn explicit_indexing_waits_for_active_reindex_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("codegraph-harness-index-lock");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let file = workspace.join("sample.py");
+        std::fs::write(&file, "def sample():\n    pass\n").unwrap();
+        let mut backend = McpBackend::new_fresh(vec![workspace], Vec::new(), 100,
+            codegraph_memory::EmbeddingBackend::default(), false);
+        backend.graph_only = true;
+        let lock = backend.indexer.mcp_operation_lock.lock().await;
+        let other = backend.clone();
+        let task = tokio::spawn(async move { other.add_files_to_index(&[file]).await });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        drop(lock);
+        assert_eq!(task.await.unwrap().unwrap().0, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_force_reindex_blocks_queries_until_successful_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("codegraph-harness-force-failure");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let file = workspace.join("broken.py");
+        std::fs::write(&file, [0xff]).unwrap();
+        let server = McpServer::new_fresh(vec![workspace], Vec::new(), 100,
+            codegraph_memory::EmbeddingBackend::default(), false).with_graph_only(true);
+        let args = || Some(serde_json::json!({"force": true}));
+        assert!(server.execute_tool("codegraph_reindex_workspace", args()).await.is_err());
+        let error = server.execute_tool("codegraph_search", None).await.unwrap_err();
+        assert!(error.contains("reindex is incomplete"));
+        std::fs::write(file, "def repaired():\n    pass\n").unwrap();
+        assert!(server.execute_tool("codegraph_reindex_workspace", args()).await.is_ok());
+        assert!(!server.backend.forced_reindex_incomplete.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn forced_reindex_replaces_old_source_graph() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("codegraph-harness-force-reindex");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let file = workspace.join("sample.py");
+        std::fs::write(&file, "def before():\n    pass\n").unwrap();
+        let server = McpServer::new_fresh(vec![workspace], Vec::new(), 100,
+            codegraph_memory::EmbeddingBackend::default(), false).with_graph_only(true);
+        server.backend.index_workspace().await.unwrap();
+        std::fs::write(file, "def after():\n    pass\n").unwrap();
+        let result = server.execute_tool("codegraph_reindex_workspace", Some(serde_json::json!({"force": true}))).await.unwrap();
+        assert_eq!(result["status"], "success");
+        let graph = server.backend.graph.read().await;
+        let names: Vec<_> = graph.iter_nodes().filter_map(|(_, node)| node.properties.get_string("name")).collect();
+        assert!(names.contains(&"after"));
+        assert!(!names.contains(&"before"));
+    }
+
+    #[tokio::test]
+    async fn failed_initial_index_reports_error_and_retries_after_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("codegraph-harness-initial-index-failure");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let file = workspace.join("broken.py");
+        std::fs::write(&file, [0xff]).unwrap();
+        let mut server = McpServer::new_fresh(vec![workspace], Vec::new(), 100,
+            codegraph_memory::EmbeddingBackend::default(), false).with_graph_only(true);
+        server.watch_workspace = false;
+        let error = server.ensure_indexed().await.unwrap_err();
+        assert!(error.contains("Failed to parse"));
+        assert!(!server.indexed);
+        let response = server.tools_call_response(None, None).await;
+        assert!(response.error.unwrap().message.contains("Failed to parse"));
+        std::fs::write(file, "def repaired():\n    pass\n").unwrap();
+        server.ensure_indexed().await.unwrap();
+        assert!(server.indexed);
+        assert!(server.index_error.is_none());
+    }
 
     #[test]
     fn one_shot_mode_does_not_start_a_workspace_watcher() {
