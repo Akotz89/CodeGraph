@@ -304,7 +304,8 @@ impl WorkspaceFilter {
         // registry is the authoritative extension list; the shared filter
         // keeps this list to text source formats supported by it.
         let exact_cpp = config.exact_cpp_files.iter().any(|selected| selected == path);
-        if !ext.is_empty() && !exact_cpp && crate::parser_registry::source_template_kind(path).is_none() && !config
+        let cmake_lists = path.file_name().is_some_and(|name| name == "CMakeLists.txt");
+        if !ext.is_empty() && !exact_cpp && !cmake_lists && crate::parser_registry::source_template_kind(path).is_none() && !config
             .explicit_source_extensions
             .iter()
             .any(|known| known == ext)
@@ -350,7 +351,7 @@ impl WorkspaceFilter {
         // scripts and CMake source/configuration under default-pruned example
         // and dist trees. Compiled web assets and other generated outputs stay
         // out even when a caller accidentally lists them.
-        if bypasses_pruned_directory && !matches!(ext, "sh" | "cmake" | "") {
+        if bypasses_pruned_directory && !cmake_lists && !matches!(ext, "sh" | "cmake" | "") {
             return false;
         }
         let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -2134,6 +2135,37 @@ mod tests {
         assert!(!filter.admits(&sibling));
         std::fs::OpenOptions::new().write(true).open(&selected).unwrap().set_len(4 * 1024 * 1024 + 1).unwrap();
         assert!(!filter.admits(&selected));
+    }
+
+    #[tokio::test]
+    async fn exact_cmake_lists_are_indexed_without_admitting_other_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let examples = root.join("examples");
+        std::fs::create_dir_all(&examples).unwrap();
+        let selected = examples.join("CMakeLists.txt");
+        let unrelated = examples.join("notes.txt");
+        let sibling = root.join("dist/CMakeLists.txt");
+        std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        std::fs::write(&selected, "project(selected_project)\n").unwrap();
+        std::fs::write(&unrelated, "private notes\n").unwrap();
+        std::fs::write(&sibling, "project(unselected_project)\n").unwrap();
+        let parsers = Arc::new(ParserRegistry::new());
+        let state = Arc::new(Mutex::new(IndexState::for_workspace("exact-cmake-test", &root)));
+        let indexer = Indexer::new(parsers.clone(), state.clone());
+        let mut config = IndexConfig::default();
+        config.explicit_source_files = vec![selected.clone(), unrelated.clone()];
+        config.explicit_source_extensions = parsers.supported_extensions().iter().map(|s| s.trim_start_matches('.').to_string()).collect();
+        let filter = WorkspaceFilter::new(std::slice::from_ref(&root), &config);
+        assert!(filter.admits(&selected));
+        assert!(!filter.admits(&unrelated));
+        assert!(!filter.admits(&sibling));
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        indexer.index_workspace(&graph, std::slice::from_ref(&root), &config).await;
+        let hashes = state.lock().await;
+        assert!(hashes.get_hash(&selected).is_some());
+        assert!(hashes.get_hash(&unrelated).is_none());
+        assert!(hashes.get_hash(&sibling).is_none());
     }
 
     #[tokio::test]
