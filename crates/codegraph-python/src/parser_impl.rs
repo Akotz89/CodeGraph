@@ -382,7 +382,7 @@ impl CodeParser for PythonParser {
     }
 
     fn file_extensions(&self) -> &[&str] {
-        &[".py", ".pyw"]
+        &[".py", ".pyw", ".pyi"]
     }
 
     fn parse_file(&self, path: &Path, graph: &mut CodeGraph) -> Result<FileInfo, ParserError> {
@@ -565,9 +565,10 @@ mod tests {
     fn test_python_parser_file_extensions() {
         let parser = PythonParser::new();
         let exts = parser.file_extensions();
-        assert_eq!(exts.len(), 2);
+        assert_eq!(exts.len(), 3);
         assert!(exts.contains(&".py"));
         assert!(exts.contains(&".pyw"));
+        assert!(exts.contains(&".pyi"));
     }
 
     #[test]
@@ -575,8 +576,19 @@ mod tests {
         let parser = PythonParser::new();
         assert!(parser.can_parse(Path::new("test.py")));
         assert!(parser.can_parse(Path::new("test.pyw")));
+        assert!(parser.can_parse(Path::new("test.pyi")));
         assert!(!parser.can_parse(Path::new("test.rs")));
         assert!(!parser.can_parse(Path::new("test.txt")));
+    }
+
+    #[test]
+    fn parses_python_stub_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.pyi");
+        std::fs::write(&path, "def fetch_player() -> int: ...\n").unwrap();
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let info = PythonParser::new().parse_file(&path, &mut graph).unwrap();
+        assert!(!info.functions.is_empty());
     }
 
     #[test]

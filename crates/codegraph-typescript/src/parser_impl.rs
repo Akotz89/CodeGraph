@@ -81,7 +81,7 @@ impl CodeParser for TypeScriptParser {
     }
 
     fn file_extensions(&self) -> &[&str] {
-        &[".ts", ".tsx", ".js", ".jsx"]
+        &[".ts", ".tsx", ".js", ".jsx", ".cjs"]
     }
 
     fn parse_file(&self, path: &Path, graph: &mut CodeGraph) -> Result<FileInfo, ParserError> {
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn test_file_extensions() {
         let parser = TypeScriptParser::new();
-        assert_eq!(parser.file_extensions(), &[".ts", ".tsx", ".js", ".jsx"]);
+        assert_eq!(parser.file_extensions(), &[".ts", ".tsx", ".js", ".jsx", ".cjs"]);
     }
 
     #[test]
@@ -289,6 +289,17 @@ mod tests {
         assert!(parser.can_parse(Path::new("test.tsx")));
         assert!(parser.can_parse(Path::new("test.js")));
         assert!(parser.can_parse(Path::new("test.jsx")));
+        assert!(parser.can_parse(Path::new("test.cjs")));
         assert!(!parser.can_parse(Path::new("test.rs")));
+    }
+
+    #[test]
+    fn parses_commonjs_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.cjs");
+        std::fs::write(&path, "function fetchPlayer() { return 1; }\nmodule.exports = fetchPlayer;\n").unwrap();
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let info = TypeScriptParser::new().parse_file(&path, &mut graph).unwrap();
+        assert!(!info.functions.is_empty());
     }
 }
