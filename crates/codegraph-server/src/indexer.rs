@@ -331,8 +331,8 @@ impl WorkspaceFilter {
                     .iter()
                     .any(|excluded| excluded == name.as_ref())
             {
-                if name == "fixtures" && ext == "json" {
-                    // Only this exact JSON file is admitted; siblings stay pruned.
+                if (name == "fixtures" && ext == "json") || (name == "logs" && ext == "php") {
+                    // Only the exact source file is admitted; siblings stay pruned.
                     continue;
                 } else if name == "examples" || name == "dist" || (name == "bin" && ext.is_empty()) {
                     bypasses_pruned_directory = true;
@@ -2175,6 +2175,34 @@ mod tests {
         let mut config = IndexConfig::default(); config.explicit_source_files = vec![selected.clone()]; config.explicit_source_extensions = vec!["json".into()];
         let filter = WorkspaceFilter::new(std::slice::from_ref(&root), &config);
         assert!(filter.admits(&selected)); assert!(!filter.admits(&sibling));
+    }
+
+    #[test]
+    fn exact_php_source_does_not_open_the_logs_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let logs = root.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let selected = logs.join("index.php");
+        let sibling = logs.join("other.php");
+        let log = logs.join("runtime.log");
+        let private = root.join("private/logs/index.php");
+        std::fs::create_dir_all(private.parent().unwrap()).unwrap();
+        for path in [&selected, &sibling, &log, &private] {
+            std::fs::write(path, "<?php http_response_code(403);").unwrap();
+        }
+        let mut config = IndexConfig::default();
+        config.exclude_dirs.push("private".into());
+        config.explicit_source_files = vec![selected.clone(), log.clone(), private.clone()];
+        config.explicit_source_extensions = vec!["php".into(), "log".into()];
+        let filter = WorkspaceFilter::new(std::slice::from_ref(&root), &config);
+        assert!(filter.admits(&selected));
+        assert!(!filter.admits(&sibling));
+        assert!(!filter.admits(&log));
+        assert!(!filter.admits(&private));
+        let mut excluded = config.clone();
+        excluded.exclude_patterns.push("**/index.php".into());
+        assert!(!WorkspaceFilter::new(&[root], &excluded).admits(&selected));
     }
 
     #[test]
