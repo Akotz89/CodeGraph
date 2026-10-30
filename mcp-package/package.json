@@ -24,14 +24,16 @@
     "codegraph-daemon": "bin/codegraph-daemon.js",
     "codegraph-mcp-install-hooks": "bin/install-hooks.js",
     "codegraph-mcp-fetch-engine": "bin/fetch-engine-cli.js",
-    "codegraph-scope-guard": "bin/codegraph-scope-guard.py"
+    "codegraph-scope-guard": "bin/codegraph-scope-guard.py",
+    "codegraph-audit-source-coverage": "bin/codegraph-audit-source-coverage.py"
   },
   "files": [
     "bin/",
     "hooks/",
     "README.md",
     "server.json",
-    "test/test_scope_guard.py"
+    "test/test_scope_guard.py",
+    "test/test_audit_source_coverage.py"
   ],
   "engines": {
     "node": ">=18.0.0"
@@ -50,6 +52,6 @@
   },
   "scripts": {
     "postinstall": "node bin/postinstall.js",
-    "test": "node test/fetch-engine.test.js && node test/wrapper-args.test.js && python3 -B -m unittest discover -s test -p test_scope_guard.py"
+    "test": "node test/fetch-engine.test.js && node test/wrapper-args.test.js && python3 -B -m unittest discover -s test -p test_audit_source_coverage.py && python3 -B -m unittest discover -s test -p test_scope_guard.py"
   }
 }
