@@ -57,6 +57,15 @@ impl SqlParser {
         }
 
         let normalized_source = normalize_mysql_delimiters(source, file_path)?;
+        let (normalized_source, database_options) =
+            strip_mysql_database_encryption(&normalized_source);
+        let (normalized_source, partial_triggers) = strip_mysql_trigger_declarations(&normalized_source);
+        let (normalized_source, signal_procedures, signal_triggers, procedure_key_directive) =
+            strip_mysql_procedure_signals(&normalized_source);
+        if procedure_key_directive {
+            return Err(ParserError::UnsupportedFeature(file_path.to_path_buf(),
+                "procedure-local ENABLE/DISABLE KEYS cannot yet retain its table relationship".to_string()));
+        }
         let (normalized_source, stored_functions) = strip_mysql_function_bodies(&normalized_source);
         let (normalized_source, dynamic_statements) =
             strip_mysql_dynamic_statements(&normalized_source);
@@ -110,6 +119,19 @@ impl SqlParser {
         for (index, kind, name) in &definitions {
             let line = statement_line(&statements[*index], &normalized_source);
             let mut properties = sql_node_properties(file_path, name, kind, line);
+            if *kind == "trigger" {
+                let mut unsupported = Vec::new();
+                if partial_triggers.contains(&normalize_procedure_name(name)) {
+                    unsupported.push("trigger local declaration semantics are not modeled");
+                }
+                if signal_triggers.contains(&normalize_procedure_name(name)) {
+                    unsupported.push("SIGNAL statement semantics");
+                }
+                if !unsupported.is_empty() {
+                    properties = properties.with("coverage", "partial")
+                        .with("unsupported_constructs", unsupported.join(", "));
+                }
+            }
             if *kind == "stored_procedure" {
                 let mut unsupported = Vec::new();
                 if source.to_ascii_uppercase().contains("IF NOT EXISTS")
@@ -119,6 +141,9 @@ impl SqlParser {
                 }
                 if source.to_ascii_uppercase().contains("PREPARE ") {
                     unsupported.push("dynamic SQL PREPARE");
+                }
+                if signal_procedures.contains(&normalize_procedure_name(name)) {
+                    unsupported.push("SIGNAL statement semantics");
                 }
                 if source.to_ascii_uppercase().contains("DECLARE ")
                     || source.to_ascii_uppercase().contains("LEAVE ")
@@ -143,6 +168,25 @@ impl SqlParser {
                 .map_err(|error| ParserError::GraphError(error.to_string()))?;
             defined_nodes.insert(normalize_name(name), node_id);
             statement_nodes.insert(*index, node_id);
+        }
+
+        for (name, value, version, line) in database_options {
+            let node = graph
+                .add_node(
+                    NodeType::Generic,
+                    sql_node_properties(file_path, &name, "mysql_database_encryption_option", line)
+                        .with("value", value.as_str())
+                        .with("version_guard", version.as_str())
+                        .with("coverage", "partial")
+                        .with(
+                            "unsupported_constructs",
+                            "database encryption effects are not modeled",
+                        ),
+                )
+                .map_err(|error| ParserError::GraphError(error.to_string()))?;
+            graph
+                .add_edge(file_id, node, EdgeType::Contains, PropertyMap::new())
+                .map_err(|error| ParserError::GraphError(error.to_string()))?;
         }
 
         for function in stored_functions {
@@ -333,6 +377,9 @@ impl SqlParser {
             };
             let mut relation_visitor = RelationCollector::default();
             let _ = statement.visit(&mut relation_visitor);
+            if let Statement::CreateTrigger(trigger) = statement {
+                relation_visitor.relations.push((trigger.table_name.to_string(), statement_line(statement, &normalized_source)));
+            }
             let own_definition = definition(statement).map(|(_, name)| normalize_name(&name));
             let mut seen_relations = std::collections::HashSet::new();
             for (name, line) in relation_visitor.relations {
@@ -634,12 +681,12 @@ impl SqlParser {
             })
             .collect();
         for id in streamed_procedures {
+            let previous = graph.get_node(id).ok().and_then(|node| node.properties.get_string("unsupported_constructs")).unwrap_or_default().to_string();
+            let streaming = "large routine body streamed to bulk summaries; procedural statements may be omitted";
+            let details = if previous.is_empty() { streaming.to_string() } else { format!("{previous}, {streaming}") };
             let properties = PropertyMap::new()
                 .with("coverage", "partial")
-                .with(
-                    "unsupported_constructs",
-                    "large routine body streamed to bulk summaries; procedural statements may be omitted",
-                );
+                .with("unsupported_constructs", details.as_str());
             graph
                 .update_node_properties(id, properties)
                 .map_err(|error| ParserError::GraphError(error.to_string()))?;
@@ -1335,6 +1382,229 @@ fn append_engine_processed_statement(
     output.push_str(statement);
 }
 
+/// Retain a mysqldump database encryption option as a partial graph node.
+fn strip_mysql_database_encryption(source: &str) -> (String, Vec<(String, String, String, usize)>) {
+    static OPTION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let option = OPTION.get_or_init(|| regex::Regex::new(
+        r"(?is)^\s*(?:(?:--[^\n]*(?:\n|$)|#[^\n]*(?:\n|$)|/\*(?:\*/|[^!].*?\*/))\s*)*CREATE\s+(?:DATABASE|SCHEMA)\s+(?:IF\s+NOT\s+EXISTS\s+)?(`(?:``|[^`])+`|[A-Z_][A-Z0-9_$]*)\s*(?:/\*![0-9]{5,6}\s+DEFAULT\s+CHARACTER\s+SET\s+[A-Z0-9_]+(?:\s+COLLATE\s+[A-Z0-9_]+)?\s*\*/\s*)?(/\*!([0-9]{5,6})\s+DEFAULT\s+ENCRYPTION\s*=\s*'([YN])'\s*\*/)\s*;\s*$"
+    ).expect("static MySQL database encryption option regex"));
+    let mut output = String::with_capacity(source.len());
+    let mut options = Vec::new();
+    let (mut start, mut cursor, mut line) = (0, 0, 1);
+    let mut state = SqlLexState::Normal;
+    while cursor < source.len() {
+        let event = next_lex_event(source.as_bytes(), &mut cursor, &mut state);
+        if matches!(event, SqlLexEvent::Terminator) {
+            let statement = &source[start..cursor];
+            if let Some(c) = option.captures(statement) {
+                let part = c.get(2).unwrap();
+                options.push((
+                    c[1].to_string(),
+                    c[4].to_ascii_uppercase(),
+                    c[3].to_string(),
+                    line + statement[..part.start()]
+                        .bytes()
+                        .filter(|b| *b == b'\n')
+                        .count(),
+                ));
+                output.push_str(&statement[..part.start()]);
+                output.extend(
+                    part.as_str()
+                        .chars()
+                        .map(|c| if c == '\n' { '\n' } else { ' ' }),
+                );
+                output.push_str(&statement[part.end()..]);
+            } else {
+                output.push_str(statement);
+            }
+            line += statement.bytes().filter(|b| *b == b'\n').count();
+            start = cursor;
+        }
+    }
+    output.push_str(&source[start..]);
+    (output, options)
+}
+
+/// Keep trigger statements while marking supported local declarations as partial.
+fn mysql_trigger_header() -> &'static regex::Regex {
+    static HEADER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    HEADER.get_or_init(|| regex::Regex::new(
+        r"(?is)^CREATE\s+TRIGGER\s+((?:`(?:``|[^`])+`|[A-Z_][A-Z0-9_$]*)(?:\s*\.\s*(?:`(?:``|[^`])+`|[A-Z_][A-Z0-9_$]*))?)\s+(?:BEFORE|AFTER)\s+(?:INSERT|UPDATE|DELETE)\s+ON\s+(?:`(?:``|[^`])+`|[A-Z_][A-Z0-9_$]*)(?:\s*\.\s*(?:`(?:``|[^`])+`|[A-Z_][A-Z0-9_$]*))?\s+FOR\s+EACH\s+ROW\s+BEGIN\b"
+    ).expect("static MySQL trigger header regex"))
+}
+
+fn strip_mysql_trigger_declarations(source: &str) -> (String, Vec<String>) {
+    static DECLARATION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let header = mysql_trigger_header();
+    let declaration = DECLARATION.get_or_init(|| regex::Regex::new(
+        r"(?is)^DECLARE\s+(?:`(?:``|[^`])+`|[A-Z_][A-Z0-9_$]*)\s+(?:INT|INTEGER)\s*;$"
+    ).expect("static MySQL integer declaration regex"));
+    let bytes = source.as_bytes();
+    let mut output = bytes.to_vec();
+    let mut partial = Vec::new();
+    let mut cursor = 0;
+    let mut state = SqlLexState::Normal;
+    while cursor < bytes.len() {
+        if state == SqlLexState::Normal && (bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_') {
+            let start = cursor;
+            while cursor < bytes.len() && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_') { cursor += 1; }
+            if !source[start..cursor].eq_ignore_ascii_case("CREATE") { continue; }
+            let Some(captures) = header.captures(&source[start..]) else { continue; };
+            let name = normalize_procedure_name(&captures[1]);
+            let mut next = start + captures.get(0).unwrap().end();
+            while let Some((word, word_end)) = next_keyword_after_comments(source, next) {
+                if !word.eq_ignore_ascii_case("DECLARE") { break; }
+                let declaration_start = word_end - word.len();
+                let mut end = word_end;
+                let mut declaration_state = SqlLexState::Normal;
+                while end < bytes.len() {
+                    if matches!(next_lex_event(bytes, &mut end, &mut declaration_state), SqlLexEvent::Terminator) { break; }
+                }
+                if !declaration.is_match(&source[declaration_start..end]) { break; }
+                for byte in &mut output[declaration_start..end] { if *byte != b'\n' { *byte = b' '; } }
+                if !partial.contains(&name) { partial.push(name.clone()); }
+                next = end;
+            }
+            cursor = next;
+        } else {
+            next_lex_event(bytes, &mut cursor, &mut state);
+        }
+    }
+    (String::from_utf8(output).expect("replaced ASCII bytes preserve UTF-8"), partial)
+}
+
+/// Keep static procedure queries while recording validated SIGNAL semantics as partial.
+fn strip_mysql_procedure_signals(source: &str) -> (String, Vec<String>, Vec<String>, bool) {
+    static SIGNAL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static PROCEDURE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let valid = SIGNAL.get_or_init(|| regex::Regex::new(
+        r"(?is)^SIGNAL\s+SQLSTATE\s+(?:VALUE\s+)?'((?-u:[0-9A-Z]{5}))'(?:\s+SET\s+MESSAGE_TEXT\s*=\s*'(?:''|\\.|[^'\\])*')?\s*;$"
+    ).expect("static MySQL SIGNAL regex"));
+    let procedure_start = PROCEDURE.get_or_init(|| regex::Regex::new(r"(?is)^CREATE\s+(?:DEFINER\s*=\s*(?:CURRENT_USER(?:\(\))?|(?:'[^']*'|`[^`]*`|[A-Z0-9_$]+)\s*@\s*(?:'[^']*'|`[^`]*`|[A-Z0-9_$]+))\s+)?PROCEDURE\s+((?:`(?:``|[^`])+`|[A-Z_][A-Z0-9_$]*)(?:\s*\.\s*(?:`(?:``|[^`])+`|[A-Z_][A-Z0-9_$]*))?)\s*\(").expect("static MySQL procedure header regex"));
+    let bytes = source.as_bytes();
+    let mut output = bytes.to_vec();
+    let mut signal_procedures = Vec::new();
+    let mut signal_triggers = Vec::new();
+    let mut procedure_key_directive = false;
+    let (mut cursor, mut depth) = (0, 0usize);
+    let mut procedure: Option<String> = None;
+    let mut is_trigger = false;
+    let mut state = SqlLexState::Normal;
+    while cursor < bytes.len() {
+        if state == SqlLexState::Normal
+            && (bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_')
+        {
+            let start = cursor;
+            while cursor < bytes.len()
+                && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+            {
+                cursor += 1;
+            }
+            let token = &source[start..cursor];
+            if token.eq_ignore_ascii_case("CREATE") {
+                if let Some(captures) = procedure_start.captures(&source[start..]) {
+                    procedure = Some(normalize_procedure_name(&captures[1]));
+                    is_trigger = false;
+                    cursor = start + captures.get(0).unwrap().end();
+                } else if let Some(captures) = mysql_trigger_header().captures(&source[start..]) {
+                    procedure = Some(normalize_procedure_name(&captures[1]));
+                    is_trigger = true;
+                    depth = 1;
+                    cursor = start + captures.get(0).unwrap().end();
+                }
+                continue;
+            }
+            if procedure.is_none() {
+                continue;
+            }
+            if token.eq_ignore_ascii_case("BEGIN") || token.eq_ignore_ascii_case("CASE") {
+                depth += 1;
+            }
+            let (end_suffix, suffix_end) = next_keyword_after_comments(source, cursor).unwrap_or(("", cursor));
+            if token.eq_ignore_ascii_case("END") && depth > 0 && !["IF", "WHILE", "LOOP", "REPEAT"].iter().any(|suffix| end_suffix.eq_ignore_ascii_case(suffix)) {
+                depth -= 1;
+                if end_suffix.eq_ignore_ascii_case("CASE") {
+                    cursor = suffix_end;
+                }
+                if depth == 0 {
+                    procedure = None;
+                }
+            }
+            if depth > 0 && token.eq_ignore_ascii_case("ALTER") {
+                let mut end = cursor;
+                let mut statement_state = SqlLexState::Normal;
+                while end < bytes.len() {
+                    if matches!(next_lex_event(bytes, &mut end, &mut statement_state), SqlLexEvent::Terminator) { break; }
+                }
+                procedure_key_directive |= parse_mysql_key_directive(&source[start..end], 1).is_some();
+            }
+            if depth > 0 && token.eq_ignore_ascii_case("SIGNAL") {
+                let mut end = cursor;
+                let mut signal_state = SqlLexState::Normal;
+                while end < bytes.len() {
+                    if matches!(
+                        next_lex_event(bytes, &mut end, &mut signal_state),
+                        SqlLexEvent::Terminator
+                    ) {
+                        break;
+                    }
+                }
+                let statement = &source[start..end];
+                if let Some(c) = valid.captures(statement) {
+                    if !c[1].starts_with("00") {
+                        let targets = if is_trigger { &mut signal_triggers } else { &mut signal_procedures };
+                        targets.push(procedure.as_ref().unwrap().clone());
+                        for byte in &mut output[start..end] {
+                            if *byte != b'\n' {
+                                *byte = b' ';
+                            }
+                        }
+                        cursor = end;
+                    }
+                }
+            }
+        } else {
+            next_lex_event(bytes, &mut cursor, &mut state);
+        }
+    }
+    (
+        String::from_utf8(output).expect("replaced ASCII bytes preserve UTF-8"),
+        signal_procedures,
+        signal_triggers,
+        procedure_key_directive,
+    )
+}
+
+fn next_keyword_after_comments(source: &str, mut cursor: usize) -> Option<(&str, usize)> {
+    let bytes = source.as_bytes();
+    let mut state = SqlLexState::Normal;
+    while cursor < bytes.len() {
+        if state == SqlLexState::Normal && bytes[cursor].is_ascii_alphabetic() {
+            let start = cursor;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_alphabetic() { cursor += 1; }
+            return Some((&source[start..cursor], cursor));
+        }
+        match next_lex_event(bytes, &mut cursor, &mut state) {
+            SqlLexEvent::Normal(byte) if !byte.is_ascii_whitespace() => return None,
+            SqlLexEvent::Terminator => return None,
+            _ if matches!(state, SqlLexState::SingleQuoted | SqlLexState::DoubleQuoted | SqlLexState::BacktickQuoted) => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn normalize_procedure_name(name: &str) -> String {
+    let mut quoted = false;
+    let mut normalized = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch == '`' { quoted = !quoted; }
+        if quoted || !ch.is_whitespace() { normalized.push(ch); }
+    }
+    normalize_name(&normalized)
+}
+
+
 /// sqlparser's MySQL dialect does not currently accept the two mysqldump
 /// load-control statements `ALTER TABLE t DISABLE KEYS` and `ENABLE KEYS`.
 /// Accept only those exact forms, retain them as explicit source-located
@@ -1350,8 +1620,28 @@ fn prepare_large_prelude(
         statement.line = map_source_line(line_map, statement.line);
     }
     let prelude = normalized.as_str();
-    if Parser::parse_sql(&MySqlDialect {}, prelude).is_ok() {
+    let (preview, _) = strip_mysql_database_encryption(prelude);
+    let (preview, _) = strip_mysql_trigger_declarations(&preview);
+    let (preview, _, _, procedure_key_directive) = strip_mysql_procedure_signals(&preview);
+    if procedure_key_directive {
+        return Err(ParserError::UnsupportedFeature(path.to_path_buf(),
+            "procedure-local ENABLE/DISABLE KEYS cannot yet retain its table relationship".to_string()));
+    }
+    if Parser::parse_sql(&MySqlDialect {}, &preview).is_ok() {
         return Ok((prelude.to_string(), Vec::new(), dynamic_statements));
+    }
+
+    // Validate the entire prelude after the same normalizations used by the
+    // normal parser, but retain its original options for metadata extraction.
+    let (without_keys, directives) = strip_mysql_key_directives(prelude, line_map);
+    if !directives.is_empty() {
+        let (preview, _) = strip_mysql_database_encryption(&without_keys);
+        let (preview, _) = strip_mysql_trigger_declarations(&preview);
+        let (preview, _, _, _) = strip_mysql_procedure_signals(&preview);
+        let (preview, _) = strip_mysql_engine_options(&preview);
+        if Parser::parse_sql(&MySqlDialect {}, &preview).is_ok() {
+            return Ok((without_keys, directives, dynamic_statements));
+        }
     }
 
     let routine_skeleton = strip_procedure_bodies(prelude);
@@ -1368,6 +1658,7 @@ fn prepare_large_prelude(
     let mut directives = Vec::new();
     let mut start = 0usize;
     let mut cursor = 0usize;
+
     let mut statement_line = 1usize;
     let mut state = SqlLexState::Normal;
     while cursor < prelude.len() {
@@ -2607,6 +2898,7 @@ fn definition(statement: &Statement) -> Option<(&'static str, String)> {
             index.name.as_ref().map(|name| ("index", name.to_string()))
         }
         Statement::CreateProcedure { name, .. } => Some(("stored_procedure", name.to_string())),
+        Statement::CreateTrigger(trigger) => Some(("trigger", trigger.name.to_string())),
         _ => None,
     }
 }
@@ -2617,6 +2909,7 @@ fn statement_kind(statement: &Statement) -> &'static str {
         Statement::CreateView(_) => "create_view",
         Statement::CreateIndex(_) => "create_index",
         Statement::CreateProcedure { .. } => "create_procedure",
+        Statement::CreateTrigger(_) => "create_trigger",
         Statement::AlterTable { .. } => "alter_table",
         Statement::Insert(_) => "insert",
         Statement::Update { .. } => "update",
@@ -2784,6 +3077,7 @@ mod tests {
             .expect("partial stored function node");
         assert_eq!(function.properties.get_string("name"), Some("AddObject"));
         assert_eq!(function.properties.get_int("line_start"), Some(3));
+
         assert_eq!(function.properties.get_string("coverage"), Some("partial"));
         let table = graph
             .iter_nodes()
@@ -2795,6 +3089,163 @@ mod tests {
             .expect("static function table reference");
         assert_eq!(table.properties.get_int("line_start"), Some(7));
     }
+
+    #[test]
+    fn parses_versioned_create_database_encryption_option() {
+        let parser = SqlParser::with_config(ParserConfig::default());
+        let mut graph = graph();
+        let source = "-- mysqldump header\n/**/\nCREATE DATABASE IF NOT EXISTS `demo` /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci */ /*!80016 DEFAULT ENCRYPTION='N' */;\nCREATE TABLE t (id INT);";
+        parser
+            .parse_source(source, Path::new("versioned.sql"), &mut graph)
+            .unwrap();
+        assert!(graph
+            .iter_nodes()
+            .any(
+                |(_, node)| node.properties.get_string("kind") == Some("table")
+                    && node.properties.get_string("name") == Some("t")
+            ));
+        assert!(graph
+            .iter_nodes()
+            .any(|(_, node)| node.properties.get_string("kind")
+                == Some("mysql_database_encryption_option")
+                && node.properties.get_string("coverage") == Some("partial")
+                && node.properties.get_string("version_guard") == Some("80016")));
+    }
+
+    #[test]
+    fn parses_valid_signal_and_preserves_procedure_references() {
+        let parser = SqlParser::with_config(ParserConfig::default());
+        let mut graph = graph();
+        let source = "DELIMITER //\nCREATE PROCEDURE p() BEGIN\n IF NOT EXISTS (SELECT 1 FROM t WHERE id = n) THEN\n SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'synthetic';\n END IF;\nEND//\nDELIMITER ;";
+        parser
+            .parse_source(source, Path::new("signal.sql"), &mut graph)
+            .unwrap();
+        let procedure = graph
+            .iter_nodes()
+            .map(|(_, node)| node)
+            .find(|node| node.properties.get_string("kind") == Some("stored_procedure"))
+            .unwrap();
+        assert_eq!(procedure.properties.get_string("coverage"), Some("partial"));
+        assert!(procedure
+            .properties
+            .get_string("unsupported_constructs")
+            .unwrap_or_default()
+            .contains("SIGNAL"));
+        let refs = graph
+            .get_neighbors_by_edge_type(procedure.id, Direction::Outgoing, EdgeType::References)
+            .unwrap();
+        assert!(refs.iter().any(|id| graph
+            .get_node(*id)
+            .is_ok_and(|node| node.properties.get_string("name") == Some("t"))));
+    }
+
+    #[test]
+    fn rejects_malformed_signal_and_versioned_encryption() {
+        let parser = SqlParser::with_config(ParserConfig::default());
+        for source in ["DELIMITER //\nCREATE PROCEDURE p() BEGIN SIGNAL SQLSTATE '4' SET MESSAGE_TEXT = 'bad'; END//\nDELIMITER ;", "CREATE DATABASE d /*!80016 DEFAULT ENCRYPTION='maybe' */;"] {
+            assert!(parser.parse_source(source, Path::new("bad.sql"), &mut graph()).is_err());
+        }
+    }
+
+    #[test]
+    fn signal_normalization_does_not_touch_literals_comments_or_other_procedures() {
+        let source = "SELECT 'SIGNAL SQLSTATE ''45000'''; -- SIGNAL SQLSTATE '45000';\nCREATE PROCEDURE p() BEGIN SELECT 1; SIGNAL SQLSTATE '45000'; END; CREATE PROCEDURE q() BEGIN SELECT 1; END;";
+        let (normalized, procedures, _, _) = strip_mysql_procedure_signals(source);
+        assert!(normalized.starts_with("SELECT 'SIGNAL SQLSTATE ''45000'''; -- SIGNAL SQLSTATE '45000';"));
+        assert_eq!(procedures, vec!["p"]);
+        assert!(normalized.contains("CREATE PROCEDURE q() BEGIN SELECT 1; END;"));
+        let outside = "SIGNAL SQLSTATE '45000';";
+        assert_eq!(strip_mysql_procedure_signals(outside).0, outside);
+        let loop_source = "CREATE PROCEDURE p() BEGIN WHILE x DO SELECT 1; END WHILE; SIGNAL SQLSTATE '45000'; END;";
+        assert_eq!(strip_mysql_procedure_signals(loop_source).1, vec!["p"]);
+        let case_source = "CREATE PROCEDURE p() BEGIN CASE x WHEN 1 THEN SELECT 1; END CASE; END; SIGNAL SQLSTATE '45000';";
+        assert_eq!(strip_mysql_procedure_signals(case_source).0, case_source);
+        let commented_case = "CREATE PROCEDURE p() BEGIN CASE x WHEN 1 THEN SELECT 1; END /* comment */ CASE; END; SIGNAL SQLSTATE '45000';";
+        assert_eq!(strip_mysql_procedure_signals(commented_case).0, commented_case);
+        let unicode_state = "CREATE PROCEDURE p() BEGIN SIGNAL SQLSTATE 'K5000'; END;";
+        assert_eq!(strip_mysql_procedure_signals(unicode_state).0, unicode_state);
+        assert_eq!(normalize_procedure_name("db . `p name`"), normalize_procedure_name("db.`p name`"));
+    }
+
+    #[test]
+    fn same_line_qualified_procedures_keep_distinct_signal_coverage() {
+        let parser = SqlParser::with_config(ParserConfig::default());
+        let mut graph = graph();
+        let source = "DELIMITER //\nCREATE PROCEDURE `db` . `p`() BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'one; two'; END// CREATE PROCEDURE q() BEGIN SELECT 1; END//\nDELIMITER ;";
+        parser.parse_source(source, Path::new("two.sql"), &mut graph).unwrap();
+        let procedures: Vec<_> = graph.iter_nodes().map(|(_, node)| node).filter(|node| node.properties.get_string("kind") == Some("stored_procedure")).collect();
+        assert_eq!(procedures.len(), 2);
+        let marked = procedures.iter().filter(|node| node.properties.get_string("unsupported_constructs").unwrap_or_default().contains("SIGNAL")).count();
+        assert_eq!(marked, 1);
+        assert!(procedures.iter().any(|node| node.properties.get_string("name").unwrap_or_default().contains("`p`") && node.properties.get_string("coverage") == Some("partial")));
+    }
+
+    #[test]
+    fn streamed_sql_keeps_signal_coverage_and_database_option() {
+        let parser = SqlParser::with_config(ParserConfig::default().with_max_file_size(64));
+        let mut graph = graph();
+        let mut file = tempfile::NamedTempFile::with_suffix(".sql").unwrap();
+        std::io::Write::write_all(&mut file, b"CREATE DATABASE d /*!80016 DEFAULT ENCRYPTION='N' */;\nDELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT 1 FROM t; SIGNAL SQLSTATE '45000'; END//\nDELIMITER ;\nINSERT INTO t VALUES (1), (2);\n").unwrap();
+        parser.parse_file(file.path(), &mut graph).unwrap();
+        let procedure = graph.iter_nodes().map(|(_, node)| node).find(|node| node.properties.get_string("kind") == Some("stored_procedure")).unwrap();
+        assert!(procedure.properties.get_string("unsupported_constructs").unwrap_or_default().contains("SIGNAL"));
+        assert!(graph.iter_nodes().any(|(_, node)| node.properties.get_string("kind") == Some("mysql_database_encryption_option")));
+    }
+
+    #[test]
+    fn streams_mixed_database_option_key_directive_and_routine() {
+        let parser = SqlParser::with_config(ParserConfig::default().with_max_file_size(64));
+        let mut graph = graph();
+        let mut file = tempfile::NamedTempFile::with_suffix(".sql").unwrap();
+        std::io::Write::write_all(&mut file, b"CREATE DATABASE d /*!80016 DEFAULT ENCRYPTION='N' */;\nCREATE TABLE t (id INT);\nALTER TABLE t DISABLE KEYS;\nDELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT 1 FROM t; SIGNAL SQLSTATE '45000'; END//\nDELIMITER ;\nINSERT INTO t VALUES (1), (2);\n").unwrap();
+        parser.parse_file(file.path(), &mut graph).unwrap();
+        let nodes: Vec<_> = graph.iter_nodes().map(|(_, node)| node).collect();
+        assert!(nodes.iter().any(|node| node.properties.get_string("kind") == Some("mysql_database_encryption_option")));
+        assert!(nodes.iter().any(|node| node.properties.get_string("kind") == Some("mysql_key_directive")));
+        assert!(nodes.iter().any(|node| node.properties.get_string("kind") == Some("bulk_insert")));
+        let procedure = nodes.iter().find(|node| node.properties.get_string("kind") == Some("stored_procedure")).unwrap();
+        assert!(procedure.properties.get_string("unsupported_constructs").unwrap_or_default().contains("SIGNAL"));
+        let refs = graph.get_neighbors_by_edge_type(procedure.id, Direction::Outgoing, EdgeType::References).unwrap();
+        assert!(refs.iter().any(|id| graph.get_node(*id).is_ok_and(|node| node.properties.get_string("name") == Some("t"))));
+    }
+
+    #[test]
+    fn rejects_procedure_local_key_directive_without_losing_reference() {
+        let source = "DELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT 1; ALTER TABLE t DISABLE KEYS; SIGNAL SQLSTATE '45000'; END//\nDELIMITER ;\nINSERT INTO t VALUES (1), (2);\n";
+        for streaming in [false, true] {
+            let parser = SqlParser::with_config(ParserConfig::default().with_max_file_size(if streaming { 64 } else { 4096 }));
+            let mut graph = graph();
+            let mut file = tempfile::NamedTempFile::with_suffix(".sql").unwrap();
+            std::io::Write::write_all(&mut file, source.as_bytes()).unwrap();
+            assert!(matches!(parser.parse_file(file.path(), &mut graph), Err(ParserError::UnsupportedFeature(_, _))));
+            assert_eq!(graph.node_count(), 0);
+        }
+    }
+
+    #[test]
+    fn parses_trigger_declaration_and_preserves_static_references() {
+        let source = "DELIMITER //\nCREATE TRIGGER tr BEFORE INSERT ON target FOR EACH ROW BEGIN\n DECLARE counter INT;\n SELECT COUNT(*) INTO counter FROM source WHERE id = NEW.id;\n IF counter > 0 THEN SET NEW.value = (SELECT value FROM source WHERE id = NEW.id); ELSE SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fixture'; END IF;\nEND//\nDELIMITER ;";
+        let parser = SqlParser::with_config(ParserConfig::default());
+        let mut graph = graph();
+        parser.parse_source(source, Path::new("trigger.sql"), &mut graph).unwrap();
+        let trigger = graph.iter_nodes().map(|(_, node)| node).find(|node| node.properties.get_string("kind") == Some("trigger")).unwrap();
+        assert_eq!(trigger.properties.get_string("coverage"), Some("partial"));
+        assert!(trigger.properties.get_string("unsupported_constructs").unwrap_or_default().contains("SIGNAL"));
+        let refs = graph.get_neighbors_by_edge_type(trigger.id, Direction::Outgoing, EdgeType::References).unwrap();
+        for name in ["target", "source"] {
+            assert!(refs.iter().any(|id| graph.get_node(*id).is_ok_and(|node| node.properties.get_string("name") == Some(name))), "missing trigger reference: {name}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_trigger_declaration() {
+        let parser = SqlParser::with_config(ParserConfig::default());
+        let mut graph = graph();
+        let source = "DELIMITER //\nCREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW BEGIN DECLARE counter INT garbage; SELECT 1; END//\nDELIMITER ;";
+        assert!(parser.parse_source(source, Path::new("bad-trigger.sql"), &mut graph).is_err());
+        assert_eq!(graph.node_count(), 0);
+    }
+
 
     #[test]
     fn marks_mysql_routine_control_flow_and_dynamic_sql_as_partial() {
