@@ -1,6 +1,6 @@
 {
   "name": "@astudioplus/codegraph-mcp",
-  "version": "0.21.0",
+  "version": "0.21.1-cpi420.0",
   "mcpName": "io.github.codegraph-ai/codegraph",
   "description": "CodeGraph MCP server \u2014 cross-language code intelligence with 42 tools, 38 languages",
   "author": "Andrey Vasilevsky <anvanster@gmail.com>",
@@ -23,13 +23,15 @@
     "codegraph-mcp": "bin/codegraph-mcp.js",
     "codegraph-daemon": "bin/codegraph-daemon.js",
     "codegraph-mcp-install-hooks": "bin/install-hooks.js",
-    "codegraph-mcp-fetch-engine": "bin/fetch-engine-cli.js"
+    "codegraph-mcp-fetch-engine": "bin/fetch-engine-cli.js",
+    "codegraph-scope-guard": "bin/codegraph-scope-guard.py"
   },
   "files": [
     "bin/",
     "hooks/",
     "README.md",
-    "server.json"
+    "server.json",
+    "test/test_scope_guard.py"
   ],
   "engines": {
     "node": ">=18.0.0"
@@ -48,6 +50,6 @@
   },
   "scripts": {
     "postinstall": "node bin/postinstall.js",
-    "test": "node test/fetch-engine.test.js && node test/wrapper-args.test.js"
+    "test": "node test/fetch-engine.test.js && node test/wrapper-args.test.js && python3 -B -m unittest discover -s test -p test_scope_guard.py"
   }
 }
