@@ -169,3 +169,12 @@ Opt out: set `CODEGRAPH_TELEMETRY=off` in your environment.
 ## License
 
 Apache-2.0 — [GitHub](https://github.com/codegraph-ai/CodeGraph)
+# Optional Codex scope guard
+
+The `codegraph-scope-guard` entry point requires Python 3.11 or newer. Set
+`CODEGRAPH_GUARD_PROJECT_ROOT` to the absolute project root containing
+`.codex/config.toml`, and `CODEGRAPH_GUARD_BINARY` to the absolute server
+executable. Give the guard the same arguments and state/scope environment as
+the corresponding configured `codegraph-*` MCP server. The guard rejects
+scope mismatches before launching the executable. It does not protect direct
+server invocations or enforce configuration in other processes.
