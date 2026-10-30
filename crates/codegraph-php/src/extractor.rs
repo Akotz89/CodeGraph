@@ -9,6 +9,105 @@ use tree_sitter::Parser;
 
 use crate::visitor::PhpVisitor;
 
+fn followed_by_named_argument_colon(mut tail: &[u8]) -> bool {
+    loop {
+        tail = tail.trim_ascii_start();
+        if tail.starts_with(b"/*") {
+            let Some(end) = tail.windows(2).position(|part| part == b"*/") else {
+                return false;
+            };
+            tail = &tail[end + 2..];
+        } else if tail.starts_with(b"//") || (tail.starts_with(b"#") && !tail.starts_with(b"#[")) {
+            let Some(end) = tail.iter().position(|b| *b == b'\n' || *b == b'\r') else {
+                return false;
+            };
+            tail = &tail[end..];
+        } else {
+            return tail.starts_with(b":") && !tail.starts_with(b"::");
+        }
+    }
+}
+
+// Tree-sitter rejects reserved words as PHP named-argument labels.
+fn keyword_argument_errors(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    spans: &mut Vec<std::ops::Range<usize>>,
+) {
+    // In nested expressions the grammar can misread `new:` as object creation.
+    if node.kind() == "object_creation_expression" && node.has_error() {
+        let start = node.start_byte();
+        let tail = &source[start..node.end_byte()];
+        let in_arguments = std::iter::successors(node.parent(), |parent| parent.parent())
+            .any(|parent| parent.kind() == "arguments");
+        if in_arguments && tail.len() >= 4 && tail[..3].eq_ignore_ascii_case(b"new") {
+            if followed_by_named_argument_colon(&tail[3..]) {
+                spans.push(start..start + 3);
+            }
+        }
+    }
+    if node.is_error()
+        && node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "arguments")
+    {
+        let mut cursor = node.walk();
+        let parts: Vec<_> = node
+            .children(&mut cursor)
+            .filter(|part| part.kind() != "comment")
+            .collect();
+        if let [label, colon] = parts.as_slice() {
+            let name = &source[label.byte_range()];
+            if !name.is_empty()
+                && &source[colon.byte_range()] == b":"
+                && (name[0].is_ascii_alphabetic() || name[0] == b'_')
+                && name.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            {
+                spans.push(label.byte_range());
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.has_error() {
+            keyword_argument_errors(child, source, spans);
+        }
+    }
+}
+
+fn invalid_repaired_argument_order(
+    node: tree_sitter::Node<'_>,
+    spans: &[std::ops::Range<usize>],
+) -> bool {
+    if node.kind() == "arguments" {
+        let mut cursor = node.walk();
+        let arguments: Vec<_> = node
+            .children(&mut cursor)
+            .filter(|child| child.kind() == "argument")
+            .collect();
+        let repaired = arguments.iter().any(|argument| {
+            argument
+                .child_by_field_name("name")
+                .is_some_and(|name| spans.contains(&name.byte_range()))
+        });
+        if repaired {
+            let mut named = false;
+            for argument in arguments {
+                if argument.child_by_field_name("name").is_some() {
+                    named = true;
+                } else if named {
+                    return true;
+                }
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    let invalid = node
+        .children(&mut cursor)
+        .any(|child| invalid_repaired_argument_order(child, spans));
+    invalid
+}
+
 /// Extract code entities and relationships from PHP source code
 pub fn extract(
     source: &str,
@@ -21,9 +120,33 @@ pub fn extract(
         .set_language(&language)
         .map_err(|e| ParserError::ParseError(file_path.to_path_buf(), e.to_string()))?;
 
-    let tree = parser.parse(source, None).ok_or_else(|| {
+    let mut tree = parser.parse(source, None).ok_or_else(|| {
         ParserError::ParseError(file_path.to_path_buf(), "Failed to parse".to_string())
     })?;
+
+    if tree.root_node().has_error() {
+        let mut spans = Vec::new();
+        keyword_argument_errors(tree.root_node(), source.as_bytes(), &mut spans);
+        if !spans.is_empty() {
+            let mut normalized = source.as_bytes().to_vec();
+            for span in &spans {
+                normalized[span.clone()].fill(b'x');
+            }
+            tree = parser.parse(&normalized, None).ok_or_else(|| {
+                ParserError::ParseError(file_path.to_path_buf(), "Failed to parse".to_string())
+            })?;
+            if !tree.root_node().has_error()
+                && invalid_repaired_argument_order(tree.root_node(), &spans)
+            {
+                return Err(ParserError::SyntaxError(
+                    file_path.to_path_buf(),
+                    0,
+                    0,
+                    "Positional or unpacked argument after named argument".to_string(),
+                ));
+            }
+        }
+    }
 
     let root_node = tree.root_node();
 
@@ -69,6 +192,48 @@ pub fn extract(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_keyword_named_argument_but_rejects_bad_syntax() {
+        let config = ParserConfig::default();
+        let valid = "<?php\nfunction f($new) {}\nfunction caller() { f(new: 1); }";
+        let ir = extract(valid, Path::new("valid.php"), &config).unwrap();
+        assert!(ir.functions.iter().any(|f| f.name == "caller"));
+        assert!(ir
+            .calls
+            .iter()
+            .any(|c| c.caller == "caller" && c.callee == "f" && c.call_site_line == 3));
+        let nested = "<?php function caller($v) { check(!f($v, new: 'x') && !$v->flag, 'ok'); }";
+        let nested_ir = extract(nested, Path::new("nested.php"), &config).unwrap();
+        assert!(nested_ir.calls.iter().any(|c| c.callee == "f"));
+        let adjacent = "<?php $x = new Probe(); check(!f($x, new: 'x') && !$x->flag, 'ok');";
+        assert!(extract(adjacent, Path::new("adjacent.php"), &config).is_ok());
+        let commented = "<?php f(new /* note */ : 1);";
+        assert!(extract(commented, Path::new("commented.php"), &config).is_ok());
+        let nested_comment =
+            "<?php $x = new Probe(); check(!f($x, new /* note */ : 'x') && !$x->flag, 'ok');";
+        assert!(extract(nested_comment, Path::new("nested-comment.php"), &config).is_ok());
+        let literals = "<?php function caller() { f('new:'); /* new: */ f(new: 1); }";
+        assert!(extract(literals, Path::new("literals.php"), &config).is_ok());
+        let duplicate = "<?php f(new: 1, new: 2);";
+        assert!(extract(duplicate, Path::new("duplicate.php"), &config).is_ok());
+        for invalid in ["<?php f(new: 1, 2);", "<?php f(new: 1, ...[2]);"] {
+            assert!(matches!(
+                extract(invalid, Path::new("bad-order.php"), &config),
+                Err(ParserError::SyntaxError(..))
+            ));
+        }
+        let invalid = "<?php function f($new) {} f(new: );";
+        assert!(matches!(
+            extract(invalid, Path::new("bad.php"), &config),
+            Err(ParserError::SyntaxError(..))
+        ));
+        let unrelated_error = "<?php function f($new) {} f(new: 1); function broken( {";
+        assert!(matches!(
+            extract(unrelated_error, Path::new("bad.php"), &config),
+            Err(ParserError::SyntaxError(..))
+        ));
+    }
 
     #[test]
     fn test_extract_simple_function() {
