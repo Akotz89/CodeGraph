@@ -45,11 +45,59 @@ class SourceCoverageClassificationTest(unittest.TestCase):
             result = subprocess.run(command, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)['recorded'], 1)
+            self.assertNotIn('unavailable_roots', json.loads(result.stdout))
             (repo / 'other.py').write_text('print(2)\n')
             subprocess.run(['git', '-C', str(repo), 'add', 'other.py'], check=True)
             result = subprocess.run(command, capture_output=True, text=True)
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertEqual(json.loads(result.stdout)['missing'], [str(repo / 'other.py')])
+
+    def test_unavailable_roots_are_reported_while_other_roots_are_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / 'source'
+            repo.mkdir()
+            subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+            (repo / 'main.py').write_text('print(1)\n')
+            subprocess.run(['git', '-C', str(repo), 'add', 'main.py'], check=True)
+            absent = root / 'absent'
+            nongit = root / 'nongit'
+            nongit.mkdir()
+            state = root / 'state.json'
+            state.write_text(json.dumps({str(repo / 'main.py'): 1}))
+            config = root / 'config.toml'
+            command = [sys.executable, str(SCRIPT), '--project-root', str(root), '--config', str(config),
+                       '--endpoint', 'selected', '--state', str(state)]
+            for roots in ([repo, absent, nongit], [absent, repo, nongit]):
+                argv = sum((['--workspace', str(path)] for path in roots), [])
+                config.write_text('[mcp_servers.selected]\nargs = ' + json.dumps(argv) + '\n')
+                result = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual((report['roots'], report['eligible'], report['recorded']), (3, 1, 1))
+                self.assertEqual(report['missing'], [])
+                self.assertEqual(report['unavailable_roots'], [
+                    {'path': str(absent), 'reason': 'missing_or_not_directory'},
+                    {'path': str(nongit), 'reason': 'git_failed'},
+                ])
+
+    def test_invalid_configuration_fails_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / 'state.json'
+            state.write_text('{}')
+            config = root / 'config.toml'
+            command = [sys.executable, str(SCRIPT), '--project-root', str(root), '--config', str(config),
+                       '--endpoint', 'selected', '--state', str(state)]
+            for contents in ('[mcp_servers.other]\nargs = []\n',
+                             '[mcp_servers.selected]\nargs = "bad"\n',
+                             '[mcp_servers.selected]\nargs = ["--workspace", "--include-file"]\n',
+                             '[broken'):
+                config.write_text(contents)
+                result = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn('invalid endpoint configuration', result.stderr)
+                self.assertNotIn('Traceback', result.stderr)
 
 
 if __name__ == '__main__':

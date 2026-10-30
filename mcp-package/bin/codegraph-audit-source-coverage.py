@@ -50,20 +50,40 @@ def main():
     if not isinstance(state, dict):
         parser.error('index state is not a path-to-hash object')
     config_path = args.config if args.config.is_absolute() else args.project_root / args.config
-    config = tomllib.loads(config_path.read_text())
-    argv = config['mcp_servers'][args.endpoint]['args']
+    try:
+        config = tomllib.loads(config_path.read_text())
+        argv = config['mcp_servers'][args.endpoint]['args']
+        if not isinstance(argv, list) or any(not isinstance(value, str) for value in argv):
+            raise ValueError('endpoint args must be a list of strings')
+        if any(i + 1 == len(argv) or argv[i + 1].startswith('--')
+               for i, value in enumerate(argv) if value in ('--workspace', '--include-file')):
+            raise ValueError('workspace or include option is missing its value')
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, KeyError, TypeError, ValueError) as exc:
+        parser.error(f'invalid endpoint configuration: {exc}')
     def configured_path(value):
         path = Path(value)
         return path if path.is_absolute() else args.project_root / path
 
     roots = [configured_path(argv[i + 1]) for i, v in enumerate(argv[:-1]) if v == '--workspace']
     included = {str(configured_path(argv[i + 1])) for i, v in enumerate(argv[:-1]) if v == '--include-file'}
-    if not roots or not any(str(roots[0]) + '/' in key for key in state):
-        parser.error('state does not contain files under the configured primary source root')
+    if not roots:
+        parser.error('endpoint has no configured source roots')
     checked, generated, unlisted_config, missing = 0, [], [], []
-    for root in roots:
-        result = subprocess.run(['git', '-C', str(root), 'ls-files', '-z'],
-                                check=True, capture_output=True)
+    unavailable_roots = []
+    for index, root in enumerate(roots):
+        if not root.is_dir():
+            unavailable_roots.append({'path': str(root), 'reason': 'missing_or_not_directory'})
+            continue
+        try:
+            result = subprocess.run(['git', '-C', str(root), 'ls-files', '-z'], capture_output=True)
+        except OSError:
+            unavailable_roots.append({'path': str(root), 'reason': 'git_unavailable'})
+            continue
+        if result.returncode:
+            unavailable_roots.append({'path': str(root), 'reason': 'git_failed'})
+            continue
+        if index == 0 and not any(str(root) + '/' in key for key in state):
+            parser.error('state does not contain files under the configured primary source root')
         for raw in result.stdout.split(b'\0'):
             if not raw:
                 continue
@@ -86,10 +106,13 @@ def main():
             checked += 1
             if str(path) not in state:
                 missing.append(str(path))
-    print(json.dumps({'roots': len(roots), 'eligible': checked, 'recorded': checked - len(missing),
-                      'missing': sorted(missing), 'excluded_generated_or_examples': sorted(generated),
-                      'excluded_unlisted_config': sorted(unlisted_config)}, indent=2))
-    return bool(missing)
+    report = {'roots': len(roots), 'eligible': checked, 'recorded': checked - len(missing),
+              'missing': sorted(missing), 'excluded_generated_or_examples': sorted(generated),
+              'excluded_unlisted_config': sorted(unlisted_config)}
+    if unavailable_roots:
+        report['unavailable_roots'] = sorted(unavailable_roots, key=lambda item: item['path'])
+    print(json.dumps(report, indent=2))
+    return bool(missing or unavailable_roots)
 
 
 if __name__ == '__main__':

@@ -194,4 +194,6 @@ codegraph-audit-source-coverage --project-root /path/to/project \
 
 Relative config, workspace and exact include paths resolve from the supplied
 project root. Missing files cause a nonzero exit; generated and unlisted
-configuration files are reported separately.
+configuration files are reported separately. Unavailable workspace roots are
+listed in `unavailable_roots` and also cause a nonzero exit, while available
+roots are still checked. The field is omitted when every root is available.
