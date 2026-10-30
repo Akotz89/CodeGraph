@@ -178,3 +178,20 @@ executable. Give the guard the same arguments and state/scope environment as
 the corresponding configured `codegraph-*` MCP server. The guard rejects
 scope mismatches before launching the executable. It does not protect direct
 server invocations or enforce configuration in other processes.
+
+## Source coverage audit
+
+`codegraph-audit-source-coverage` compares tracked, source-like files in the
+configured workspace roots with an existing saved `index_state.json`. It does
+not start or update a graph or prove semantic coverage. Python 3.11+ and Git
+are required. For example:
+
+```sh
+codegraph-audit-source-coverage --project-root /path/to/project \
+  --config .codex/config.toml --endpoint codegraph-wow \
+  --state /path/to/index_state.json
+```
+
+Relative config, workspace and exact include paths resolve from the supplied
+project root. Missing files cause a nonzero exit; generated and unlisted
+configuration files are reported separately.
