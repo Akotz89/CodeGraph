@@ -1504,11 +1504,14 @@ impl Indexer {
                             // Resolve the parser before parsing so we can
                             // attribute the file (and any error) to a
                             // specific language for telemetry.
-                            let language = self
-                                .parsers
-                                .parser_for_path(&path)
-                                .map(|p| p.language().to_string())
-                                .unwrap_or_else(|| "unknown".to_string());
+                            let language = if path.extension().is_some_and(|ext| ext == "h")
+                                && !config.exact_cpp_files.contains(&path) {
+                                "c-or-cpp".to_string()
+                            } else {
+                                self.parsers.parser_for_path(&path)
+                                    .map(|p| p.language().to_string())
+                                    .unwrap_or_else(|| "unknown".to_string())
+                            };
                             match self.index_file(graph, &path).await {
                                 Ok(was_parsed) => {
                                     total += 1;
@@ -1590,6 +1593,25 @@ impl Indexer {
 mod tests {
     use super::*;
     use codegraph::{NamespacedBackend, NodeType, PropertyMap, RocksDBBackend};
+
+    #[tokio::test]
+    async fn header_parser_upgrade_needs_fresh_index_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let file = root.join("cache.h");
+        let source = b"template <typename T> class Cache {};\n";
+        std::fs::write(&file, source).unwrap();
+        let parsers = Arc::new(ParserRegistry::new());
+        let state = Arc::new(Mutex::new(IndexState::for_workspace("header-upgrade-test", &root)));
+        state.lock().await.set_hash(file.clone(), Indexer::hash_content(source));
+        let indexer = Indexer::new(parsers, state.clone());
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        // A pre-upgrade hash alone cannot identify the old parser version.
+        assert!(!indexer.index_file(&graph, &file).await.unwrap());
+        state.lock().await.clear();
+        assert!(indexer.index_file(&graph, &file).await.unwrap());
+        assert!(graph.read().await.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("Cache")));
+    }
 
     #[tokio::test]
     async fn failed_parse_cannot_leave_an_old_hash_that_skips_restoration() {
