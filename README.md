@@ -115,7 +115,7 @@ Example: `CODEGRAPH_CALL_SCOPE_MAP='{"/project/core":"server","/project/modules"
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--workspace <path>` | current dir | Directories to index (repeatable for multi-project) |
-| `--exclude <dir>` | — | Directories to skip (repeatable) |
+| `--exclude <pattern>` | — | Exact directory names or glob patterns to skip (repeatable) |
 | `--embedding-model <model>` | `bge-small` | `bge-small` (384d, fast), `jina-code-v2` (768d, 6× slower), `granite-97m` (384d, 32K ctx, ~3× slower), or `static` (model2vec, 256d — ~100× faster indexing, no ONNX; needs a local model dir, see below) |
 | `--full-body-embedding` | `true` | Embed full function body (~50 lines) for better semantic search and duplicate detection. Takes a value: `--full-body-embedding=false` turns it off |
 | `--split-identifiers` | `true` | Also embed the word-split form of identifiers whose words are run together, so `getUserById` embeds as "get user by id" too. Names already separated by `_` or `-` are left alone, since they tokenise into the same words; a leading or trailing delimiter separates nothing, so `_handleClick` is split like `handleClick`. Takes a value: `--split-identifiers=false` embeds raw names, as releases up to 0.20.1 did |
@@ -179,6 +179,9 @@ The full 42-tool surface is convenient but inflates the agent's prompt-context c
 | `graph` | 17 — callers/callees/deps/impact/traverse/PR context | refactoring + structural analysis |
 | `memory` | 14 — `codegraph_memory_*` plus the docs tools | note-taking / knowledge-base workflows |
 | `security` | pro security tools only (empty on community) | pro security audits |
+
+
+`--exclude` patterns apply to workspace indexing and watched changes; exact directory names remain supported. Invalid glob patterns are warned about and ignored as patterns. Changing exclusions does not remove files already in a saved graph: use a fresh state or a verified forced reindex before relying on the new scope. A warm graph supplied by a running daemon may have been built with different exclusions; restart or rebuild it under verified settings before relying on those exclusions. Symlinks inside indexed roots are skipped; a workspace root may itself be a symlink.
 
 ### VS Code settings
 

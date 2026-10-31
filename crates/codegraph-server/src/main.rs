@@ -44,7 +44,7 @@ struct Args {
     #[arg(long, short)]
     workspace: Vec<PathBuf>,
 
-    /// Directories to exclude from indexing (can be specified multiple times)
+    /// Directory names or glob patterns to exclude (repeatable)
     #[arg(long, short)]
     exclude: Vec<String>,
 

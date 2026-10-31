@@ -399,7 +399,10 @@ impl WorkspaceFilter {
         let mut current = root;
         for component in components {
             current.push(component);
-            if is_excluded_entry(config, exclude_set, &current, true) {
+            if std::fs::symlink_metadata(&current)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                || is_excluded_entry(config, exclude_set, &current, true)
+            {
                 return false;
             }
         }
@@ -1448,8 +1451,11 @@ impl Indexer {
                 }
 
                 let path = entry.path();
-
-                let is_dir = path.is_dir();
+                let Ok(file_type) = entry.file_type() else { continue };
+                if file_type.is_symlink() {
+                    continue;
+                }
+                let is_dir = file_type.is_dir();
                 if is_excluded_entry(config, &exclude_set, &path, is_dir) {
                     continue;
                 }
