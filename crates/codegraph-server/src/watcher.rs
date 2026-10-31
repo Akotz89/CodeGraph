@@ -606,7 +606,17 @@ impl GraphUpdater {
         use codegraph::{EdgeType, NodeId, PropertyMap};
         use std::collections::HashMap;
 
-        fn identity(path: &str, name: &str) -> Option<(String, String, String, bool)> {
+        fn identity(path: &str, name: &str, scopes: &HashMap<String, String>) -> Option<(String, String, String, bool)> {
+            let name = name.trim_matches('`').to_ascii_lowercase();
+            if name.is_empty() || name.contains('.') || name.contains('`') { return None; }
+            if !path.contains("/data/sql/") {
+                let root = scopes.keys().filter(|root| path.strip_prefix(root.as_str()).is_some_and(|rest| rest.starts_with('/'))).max_by_key(|root| root.len())?;
+                if scopes.get(root)?.is_empty() { return None; }
+                let tail = path.strip_prefix(root.as_str())?.strip_prefix("/src/Bracket_")?;
+                let (bracket, file) = tail.split_once("/sql/world/")?;
+                if bracket.is_empty() || !bracket.bytes().all(|b| b.is_ascii_digit() || b == b'_') || !file.ends_with(".sql") { return None; }
+                return Some((root.to_owned(), "db_world".to_owned(), name, false));
+            }
             let (root, tail) = path.split_once("/data/sql/")?;
             let mut parts = tail.split('/');
             let first = parts.next()?;
@@ -623,8 +633,6 @@ impl GraphUpdater {
             };
             if !matches!(stage, "base" | "updates" | "archive" | "old") ||
                 !matches!(database, "db_world" | "db_auth" | "db_characters" | "db_playerbots") { return None; }
-            let name = name.trim_matches('`').to_ascii_lowercase();
-            if name.is_empty() || name.contains('.') || name.contains('`') { return None; }
             Some((root.to_owned(), database.to_owned(), name, stage == "base"))
         }
 
@@ -635,7 +643,7 @@ impl GraphUpdater {
         for (id, node) in graph.iter_nodes() {
             let (Some(kind), Some(path), Some(name)) = (node.properties.get_string("kind"), node.properties.get_string("path"), node.properties.get_string("name")) else { continue; };
             if !matches!(kind, "table" | "table_reference") { continue; }
-            let Some((root, database, name, base)) = identity(path, name) else { continue; };
+            let Some((root, database, name, base)) = identity(path, name, scopes) else { continue; };
             let scope = match scopes.get(&root) {
                 Some(group) if !group.is_empty() => format!("group:{group}"),
                 _ => format!("root:{root}"),
@@ -879,6 +887,34 @@ mod tests {
     }
     use super::*;
     use crate::domain::node_props;
+
+    #[test]
+    fn progression_world_sql_links_only_with_explicit_scope() {
+        use codegraph::{CodeGraph, NodeType, PropertyMap};
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let mut node = |kind: &str, path: &str| graph.add_node(NodeType::Generic,
+            PropertyMap::new().with("kind", kind).with("path", path).with("name", "creature_template")).unwrap();
+        let world = node("table", "/core/data/sql/base/db_world/creature_template.sql");
+        let auth = node("table", "/core/data/sql/base/db_auth/creature_template.sql");
+        let reference = node("table_reference", "/module/src/Bracket_61_64/sql/world/001.sql");
+        let unmapped = node("table_reference", "/other/src/Bracket_61_64/sql/world/001.sql");
+        let wrong_dir = node("table_reference", "/module/src/Bracket_61_64/sql/auth/001.sql");
+        let wrong_bracket = node("table_reference", "/module/src/Other/sql/world/001.sql");
+        let scopes = std::collections::HashMap::from([
+            ("/core".to_string(), "project".to_string()),
+            ("/module".to_string(), "project".to_string()),
+        ]);
+        GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &scopes).unwrap();
+        assert_eq!(graph.get_edges_between(reference, world).unwrap().len(), 1);
+        for (from, to) in [(reference, auth), (unmapped, world), (wrong_dir, world), (wrong_bracket, world)] {
+            assert!(graph.get_edges_between(from, to).unwrap().is_empty());
+        }
+        let duplicate = graph.add_node(NodeType::Generic, PropertyMap::new().with("kind", "table")
+            .with("path", "/core/data/sql/base/db_world/other.sql").with("name", "creature_template")).unwrap();
+        GraphUpdater::resolve_sql_table_references_with_scopes(&mut graph, &scopes).unwrap();
+        assert!(graph.get_edges_between(reference, world).unwrap().is_empty());
+        assert!(graph.get_edges_between(reference, duplicate).unwrap().is_empty());
+    }
 
     #[test]
     fn sql_links_are_scoped_unambiguous_and_reconciled() {
