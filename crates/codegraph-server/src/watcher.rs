@@ -21,6 +21,15 @@ use tower_lsp::Client;
 /// Default debounce interval in milliseconds.
 const DEFAULT_DEBOUNCE_MS: u64 = 300;
 
+#[derive(Default, serde::Deserialize)]
+struct SqlSchemaRoot {
+    aliases: HashMap<String, String>,
+    #[serde(default)]
+    default_files: HashMap<String, String>,
+    #[serde(default)]
+    definition_files: Vec<String>,
+}
+
 /// File system watcher that triggers re-parsing on changes.
 pub struct FileWatcher {
     _watcher: RecommendedWatcher,
@@ -546,7 +555,7 @@ impl GraphUpdater {
             }
         }
         let scopes = Self::sql_scope_map();
-        let (sql_obsolete, sql_additions) = Self::plan_sql_table_references(graph, &scopes);
+        let (sql_obsolete, sql_additions) = Self::plan_sql_table_references(graph, &scopes, &Self::sql_schema_map());
         let mut obsolete = obsolete_calls;
         obsolete.extend(graph.iter_edges().filter_map(|(id, edge)| {
             if edge.properties.get_string("resolved_by") != Some("cross_file_resolution") {
@@ -574,7 +583,7 @@ impl GraphUpdater {
 
     /// Link unqualified SQL references only within an unambiguous database scope.
     pub fn resolve_sql_table_references(graph: &mut CodeGraph) -> codegraph::Result<()> {
-        let (obsolete, additions) = Self::plan_sql_table_references(graph, &Self::sql_scope_map());
+        let (obsolete, additions) = Self::plan_sql_table_references(graph, &Self::sql_scope_map(), &Self::sql_schema_map());
         graph.replace_edges_batch(&obsolete, additions)?;
         Ok(())
     }
@@ -589,12 +598,22 @@ impl GraphUpdater {
         }
     }
 
+    fn sql_schema_map() -> HashMap<String, SqlSchemaRoot> {
+        match std::env::var("CODEGRAPH_SQL_SCHEMA_MAP") {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|_| {
+                tracing::warn!("Invalid SQL schema map; configured schema links are disabled");
+                Default::default()
+            }),
+            Err(_) => Default::default(),
+        }
+    }
+
     #[cfg(test)]
     fn resolve_sql_table_references_with_scopes(
         graph: &mut CodeGraph,
         scopes: &std::collections::HashMap<String, String>,
     ) -> codegraph::Result<()> {
-        let (obsolete, additions) = Self::plan_sql_table_references(graph, scopes);
+        let (obsolete, additions) = Self::plan_sql_table_references(graph, scopes, &HashMap::new());
         graph.replace_edges_batch(&obsolete, additions)?;
         Ok(())
     }
@@ -602,11 +621,23 @@ impl GraphUpdater {
     fn plan_sql_table_references(
         graph: &CodeGraph,
         scopes: &std::collections::HashMap<String, String>,
+        schema_roots: &HashMap<String, SqlSchemaRoot>,
     ) -> (Vec<codegraph::EdgeId>, Vec<(codegraph::NodeId, codegraph::NodeId, codegraph::EdgeType, codegraph::PropertyMap)>) {
         use codegraph::{EdgeType, NodeId, PropertyMap};
         use std::collections::HashMap;
 
-        fn identity(path: &str, name: &str, scopes: &HashMap<String, String>) -> Option<(String, String, String, bool)> {
+        fn identity(path: &str, name: &str, schema: Option<&str>, scopes: &HashMap<String, String>, schema_roots: &HashMap<String, SqlSchemaRoot>) -> Option<(String, String, String, bool)> {
+            if let Some(root) = schema_roots.keys().filter(|root| path.strip_prefix(root.as_str()).is_some_and(|rest| rest.starts_with('/'))).max_by_key(|root| root.len()) {
+                if scopes.get(root)?.is_empty() { return None; }
+                let config = schema_roots.get(root)?;
+                let default = config.default_files.get(path).map(String::as_str);
+                let (schema, table) = crate::sql_parser::sql_relation_parts(name, schema.or(default))?;
+                let schema = schema.as_deref()?;
+                if schema.is_empty() { return None; }
+                let database = config.aliases.get(schema)?;
+                if database.is_empty() { return None; }
+                return Some((root.to_owned(), database.to_owned(), table, config.definition_files.iter().any(|file| file == path)));
+            }
             let name = name.trim_matches('`').to_ascii_lowercase();
             if name.is_empty() || name.contains('.') || name.contains('`') { return None; }
             if !path.contains("/data/sql/") {
@@ -643,7 +674,7 @@ impl GraphUpdater {
         for (id, node) in graph.iter_nodes() {
             let (Some(kind), Some(path), Some(name)) = (node.properties.get_string("kind"), node.properties.get_string("path"), node.properties.get_string("name")) else { continue; };
             if !matches!(kind, "table" | "table_reference") { continue; }
-            let Some((root, database, name, base)) = identity(path, name, scopes) else { continue; };
+            let Some((root, database, name, base)) = identity(path, name, node.properties.get_string("sql_schema"), scopes, schema_roots) else { continue; };
             let scope = match scopes.get(&root) {
                 Some(group) if !group.is_empty() => format!("group:{group}"),
                 _ => format!("root:{root}"),
@@ -661,7 +692,12 @@ impl GraphUpdater {
 
         let mut tables: HashMap<(String, String), Vec<NodeId>> = HashMap::new();
         for ((scope, _, name), ids) in &definitions {
-            tables.entry((scope.clone(), name.clone())).or_default().extend(ids);
+            for id in ids {
+                let Some(path) = graph.get_node(*id).ok().and_then(|node| node.properties.get_string("path")) else { continue; };
+                // The legacy code-to-SQL resolver does not know a query's database.
+                if schema_roots.keys().any(|root| path.strip_prefix(root.as_str()).is_some_and(|rest| rest.starts_with('/'))) { continue; }
+                tables.entry((scope.clone(), name.clone())).or_default().push(*id);
+            }
         }
         let mut links = HashSet::new();
         let mut prepared_links = HashSet::new();
@@ -670,6 +706,7 @@ impl GraphUpdater {
         for (id, node) in graph.iter_nodes() {
             if node.node_type != codegraph::NodeType::Function { continue; }
             let Some(path) = node.properties.get_string("path") else { continue; };
+            if schema_roots.keys().any(|root| path.strip_prefix(root.as_str()).is_some_and(|rest| rest.starts_with('/'))) { continue; }
             let root = scopes.keys().filter(|root| path.strip_prefix(root.as_str()).is_some_and(|rest| rest.starts_with('/'))).max_by_key(|root| root.len()).map(String::as_str)
                 .or_else(|| path.split_once("/src/").map(|(root, _)| root));
             let Some(root) = root else { continue; };
@@ -887,6 +924,67 @@ mod tests {
     }
     use super::*;
     use crate::domain::node_props;
+
+    #[test]
+    fn explicit_sql_schema_configuration_links_only_unambiguous_databases() {
+        use codegraph::{CodeGraph, NodeType, PropertyMap};
+        use codegraph_parser_api::{CodeParser, ParserConfig};
+        use std::path::Path;
+        let mut graph = CodeGraph::in_memory().unwrap();
+        let parser = crate::sql_parser::SqlParser::with_config(ParserConfig::default());
+        let site = "/cms/SQL/site-full.sql";
+        let update = "/cms/SQL/site-update.sql";
+        let cross = "/cms/SQL/cross.sql";
+        let unknown_use = "/cms/SQL/unknown-use.sql";
+        parser.parse_source("USE site;\nCREATE TABLE shop_items (id INT);\nCREATE TABLE user_currencies (id INT);", Path::new(site), &mut graph).unwrap();
+        parser.parse_source("ALTER TABLE shop_items ADD COLUMN cost INT;", Path::new(update), &mut graph).unwrap();
+        parser.parse_source("USE auth;\nSELECT * FROM `site`.`user_currencies`;\nSELECT * FROM world.item_template;\nSELECT * FROM missing.item_template;", Path::new(cross), &mut graph).unwrap();
+        parser.parse_source("USE `unknown.schema`;\nSELECT * FROM shop_items;", Path::new(unknown_use), &mut graph).unwrap();
+        let world = graph.add_node(NodeType::Generic, PropertyMap::new().with("kind", "table")
+            .with("path", "/core/data/sql/base/db_world/item_template.sql").with("name", "item_template")).unwrap();
+        let world_code = graph.add_node(NodeType::Function, PropertyMap::new()
+            .with("path", "/core/src/world.cpp").with("sql_literal_tables", vec!["shop_items".to_string()])).unwrap();
+        let site_code = graph.add_node(NodeType::Function, PropertyMap::new()
+            .with("path", "/cms/src/site.php").with("sql_literal_tables", vec!["item_template".to_string()])).unwrap();
+        let find = |path: &str, kind: &str, name: &str| graph.iter_nodes().filter(|(_, n)|
+            n.properties.get_string("path") == Some(path) && n.properties.get_string("kind") == Some(kind)
+            && n.properties.get_string("name") == Some(name)).map(|(id, _)| id).collect::<Vec<_>>();
+        let shop = find(site, "table", "shop_items")[0];
+        let currency = find(site, "table", "user_currencies")[0];
+        let shop_ref = find(update, "table_reference", "shop_items")[0];
+        let currency_ref = find(cross, "table_reference", "`site`.`user_currencies`")[0];
+        let world_ref = find(cross, "table_reference", "world.item_template")[0];
+        let missing_ref = find(cross, "table_reference", "missing.item_template")[0];
+        let unknown_use_ref = find(unknown_use, "table_reference", "shop_items")[0];
+        let scopes = HashMap::from([(String::from("/core"), String::from("realm")), (String::from("/cms"), String::from("realm"))]);
+        let schemas = HashMap::from([(String::from("/cms"), SqlSchemaRoot {
+            aliases: HashMap::from([(String::from("site"), String::from("site")), (String::from("world"), String::from("db_world")), (String::from("auth"), String::from("db_auth")), (String::new(), String::from("site"))]),
+            default_files: HashMap::from([(update.to_string(), String::from("site")), (unknown_use.to_string(), String::from("site"))]),
+            definition_files: vec![site.to_string()],
+        })]);
+        let (obsolete, additions) = GraphUpdater::plan_sql_table_references(&graph, &scopes, &schemas);
+        graph.replace_edges_batch(&obsolete, additions).unwrap();
+        assert_eq!(graph.get_edges_between(shop_ref, shop).unwrap().len(), 1);
+        assert_eq!(graph.get_edges_between(currency_ref, currency).unwrap().len(), 1);
+        assert_eq!(graph.get_edges_between(world_ref, world).unwrap().len(), 1);
+        assert!(graph.get_edges_between(missing_ref, world).unwrap().is_empty());
+        assert!(graph.get_edges_between(unknown_use_ref, shop).unwrap().is_empty());
+        assert!(graph.get_edges_between(world_code, shop).unwrap().is_empty());
+        assert!(graph.get_edges_between(site_code, world).unwrap().is_empty());
+        let duplicate = graph.add_node(NodeType::Generic, PropertyMap::new().with("kind", "table")
+            .with("path", site).with("name", "shop_items").with("sql_schema", "site")).unwrap();
+        let (obsolete, additions) = GraphUpdater::plan_sql_table_references(&graph, &scopes, &schemas);
+        graph.replace_edges_batch(&obsolete, additions).unwrap();
+        assert!(graph.get_edges_between(shop_ref, shop).unwrap().is_empty());
+        assert!(graph.get_edges_between(shop_ref, duplicate).unwrap().is_empty());
+        let (obsolete, additions) = GraphUpdater::plan_sql_table_references(&graph, &scopes, &HashMap::new());
+        graph.replace_edges_batch(&obsolete, additions).unwrap();
+        assert!(graph.get_edges_between(world_ref, world).unwrap().is_empty());
+        let no_cms_scope = HashMap::from([(String::from("/core"), String::from("realm"))]);
+        let (obsolete, additions) = GraphUpdater::plan_sql_table_references(&graph, &no_cms_scope, &schemas);
+        graph.replace_edges_batch(&obsolete, additions).unwrap();
+        assert!(graph.get_edges_between(world_ref, world).unwrap().is_empty());
+    }
 
     #[test]
     fn progression_world_sql_links_only_with_explicit_scope() {

@@ -7,7 +7,7 @@ use codegraph::{CodeGraph, EdgeType, NodeId, NodeType, PropertyMap, PropertyValu
 use codegraph_parser_api::{
     CodeParser, FileInfo, ParserConfig, ParserError, ParserMetrics, ParserResult,
 };
-use sqlparser::ast::{ObjectName, Spanned, Statement, Visit, Visitor};
+use sqlparser::ast::{ObjectName, Spanned, Statement, Use, Visit, Visitor};
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
@@ -91,6 +91,24 @@ impl SqlParser {
                 ParserError::SyntaxError(file_path.to_path_buf(), line, column, message)
             })?;
 
+        // Keep schema context per statement; a later USE must never change an
+        // earlier definition's identity.
+        let mut current_schema = None::<String>;
+        let mut statement_schemas = Vec::with_capacity(statements.len());
+        let mut schema_changes = Vec::new();
+        for statement in &statements {
+            if let Statement::Use(use_expr) = statement {
+                current_schema = match use_expr {
+                    Use::Object(name) | Use::Database(name) | Use::Schema(name) => {
+                        Some(simple_sql_identifier(&name.to_string()).unwrap_or_default())
+                    }
+                    _ => Some(String::new()),
+                };
+                schema_changes.push((statement_line(statement, &normalized_source), current_schema.clone()));
+            }
+            statement_schemas.push(current_schema.clone());
+        }
+
         let file_name = file_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -114,11 +132,12 @@ impl SqlParser {
                 definition(statement).map(|(kind, name)| (index, kind, name))
             })
             .collect();
-        let mut defined_nodes = HashMap::<String, NodeId>::new();
+        let mut defined_nodes = HashMap::<String, Option<NodeId>>::new();
         let mut statement_nodes = HashMap::<usize, NodeId>::new();
         for (index, kind, name) in &definitions {
             let line = statement_line(&statements[*index], &normalized_source);
-            let mut properties = sql_node_properties(file_path, name, kind, line);
+            let schema = statement_schemas[*index].as_deref();
+            let mut properties = sql_relation_properties(file_path, name, kind, line, schema);
             if *kind == "trigger" {
                 let mut unsupported = Vec::new();
                 if partial_triggers.contains(&normalize_procedure_name(name)) {
@@ -166,7 +185,8 @@ impl SqlParser {
             graph
                 .add_edge(file_id, node_id, EdgeType::Defines, PropertyMap::new())
                 .map_err(|error| ParserError::GraphError(error.to_string()))?;
-            defined_nodes.insert(normalize_name(name), node_id);
+            let key = sql_relation_key(name, schema);
+            defined_nodes.entry(key).and_modify(|entry| *entry = None).or_insert(Some(node_id));
             statement_nodes.insert(*index, node_id);
         }
 
@@ -210,17 +230,18 @@ impl SqlParser {
                 .add_edge(file_id, function_id, EdgeType::Defines, PropertyMap::new())
                 .map_err(|error| ParserError::GraphError(error.to_string()))?;
             for (table, line) in function.table_references {
-                let normalized = normalize_name(&table);
-                let table_id = if let Some(id) = defined_nodes.get(&normalized) {
+                let schema = sql_schema_at_line(&schema_changes, line);
+                let normalized = sql_relation_key(&table, schema);
+                let table_id = if let Some(Some(id)) = defined_nodes.get(&normalized).filter(|_| schema != Some("")) {
                     *id
                 } else {
                     let id = graph
                         .add_node(
                             NodeType::Generic,
-                            sql_node_properties(file_path, &table, "table_reference", line),
+                            sql_relation_properties(file_path, &table, "table_reference", line, schema),
                         )
                         .map_err(|error| ParserError::GraphError(error.to_string()))?;
-                    defined_nodes.insert(normalized, id);
+                    if schema != Some("") { defined_nodes.entry(normalized).or_insert(Some(id)); }
                     id
                 };
                 graph
@@ -255,22 +276,24 @@ impl SqlParser {
                     PropertyMap::new(),
                 )
                 .map_err(|error| ParserError::GraphError(error.to_string()))?;
-            let table_key = normalize_name(&directive.table);
-            let table_id = if let Some(id) = defined_nodes.get(&table_key) {
+            let schema = sql_schema_at_line(&schema_changes, directive.line);
+            let table_key = sql_relation_key(&directive.table, schema);
+            let table_id = if let Some(Some(id)) = defined_nodes.get(&table_key).filter(|_| schema != Some("")) {
                 *id
             } else {
                 let id = graph
                     .add_node(
                         NodeType::Generic,
-                        sql_node_properties(
+                        sql_relation_properties(
                             file_path,
                             &directive.table,
                             "table_reference",
                             directive.line,
+                            schema,
                         ),
                     )
                     .map_err(|error| ParserError::GraphError(error.to_string()))?;
-                defined_nodes.insert(table_key, id);
+                if schema != Some("") { defined_nodes.entry(table_key).or_insert(Some(id)); }
                 id
             };
             graph
@@ -290,6 +313,7 @@ impl SqlParser {
             file_path,
             multi_table_updates,
             &mut defined_nodes,
+            &schema_changes,
         )?;
         add_mysql_privilege_statement_nodes(graph, file_id, file_path, privilege_statements)?;
         for (name, line) in persistent_settings {
@@ -327,22 +351,24 @@ impl SqlParser {
             graph
                 .add_edge(file_id, option_id, EdgeType::Contains, PropertyMap::new())
                 .map_err(|error| ParserError::GraphError(error.to_string()))?;
-            let normalized = normalize_name(&option.table);
-            let target_id = if let Some(id) = defined_nodes.get(&normalized) {
+            let schema = sql_schema_at_line(&schema_changes, option.line);
+            let normalized = sql_relation_key(&option.table, schema);
+            let target_id = if let Some(Some(id)) = defined_nodes.get(&normalized).filter(|_| schema != Some("")) {
                 *id
             } else {
                 let id = graph
                     .add_node(
                         NodeType::Generic,
-                        sql_node_properties(
+                        sql_relation_properties(
                             file_path,
                             &option.table,
                             "table_reference",
                             option.line,
+                            schema,
                         ),
                     )
                     .map_err(|error| ParserError::GraphError(error.to_string()))?;
-                defined_nodes.insert(normalized, id);
+                if schema != Some("") { defined_nodes.entry(normalized).or_insert(Some(id)); }
                 id
             };
             graph
@@ -356,18 +382,24 @@ impl SqlParser {
         }
 
         for (index, statement) in statements.iter().enumerate() {
+            let schema = statement_schemas[index].as_deref();
             let statement_id = if let Some(id) = statement_nodes.get(&index) {
                 *id
             } else {
+                let mut properties = sql_node_properties(
+                    file_path,
+                    &format!("{} statement {}", statement_kind(statement), index + 1),
+                    "statement",
+                    statement_line(statement, &normalized_source),
+                );
+                if matches!(statement, Statement::Use(_)) {
+                    properties = properties.with("sql_use", true)
+                        .with("sql_schema", schema.unwrap_or(""));
+                }
                 let id = graph
                     .add_node(
                         NodeType::Generic,
-                        sql_node_properties(
-                            file_path,
-                            &format!("{} statement {}", statement_kind(statement), index + 1),
-                            "statement",
-                            statement_line(statement, &normalized_source),
-                        ),
+                        properties,
                     )
                     .map_err(|error| ParserError::GraphError(error.to_string()))?;
                 graph
@@ -380,22 +412,22 @@ impl SqlParser {
             if let Statement::CreateTrigger(trigger) = statement {
                 relation_visitor.relations.push((trigger.table_name.to_string(), statement_line(statement, &normalized_source)));
             }
-            let own_definition = definition(statement).map(|(_, name)| normalize_name(&name));
+            let own_definition = definition(statement).map(|(_, name)| sql_relation_key(&name, schema));
             let mut seen_relations = std::collections::HashSet::new();
             for (name, line) in relation_visitor.relations {
-                let normalized = normalize_name(&name);
+                let normalized = sql_relation_key(&name, schema);
                 if own_definition.as_deref() == Some(normalized.as_str())
                     || !seen_relations.insert(normalized.clone())
                 {
                     continue;
                 }
-                let target_id = if let Some(id) = defined_nodes.get(&normalized) {
+                let target_id = if let Some(Some(id)) = defined_nodes.get(&normalized).filter(|_| schema != Some("")) {
                     *id
                 } else {
                     let id = graph
                         .add_node(
                             NodeType::Generic,
-                            sql_node_properties(file_path, &name, "table_reference", line),
+                            sql_relation_properties(file_path, &name, "table_reference", line, schema),
                         )
                         .map_err(|error| ParserError::GraphError(error.to_string()))?;
                     id
@@ -692,18 +724,25 @@ impl SqlParser {
                 .map_err(|error| ParserError::GraphError(error.to_string()))?;
         }
         remap_graph_source_lines(graph, path, &prelude_line_map);
+        let mut schema_changes: Vec<_> = graph.nodes_by_path(&path_text).into_iter().filter_map(|id| {
+            let node = graph.get_node(id).ok()?;
+            if node.properties.get_bool("sql_use") != Some(true) { return None; }
+            let line = usize::try_from(node.properties.get_int("line_start")?).ok()?;
+            let schema = node.properties.get_string("sql_schema").map(str::to_owned);
+            Some((line, schema))
+        }).collect();
+        schema_changes.sort_by_key(|(line, _)| *line);
         // Keep local references within this file; cross-file links are scoped later.
-        let mut table_ids: HashMap<String, NodeId> = graph
-            .nodes_by_path(&path_text)
-            .into_iter()
-            .filter_map(|id| {
+        let mut table_ids: HashMap<String, Option<NodeId>> = HashMap::new();
+        for (key, id) in graph.nodes_by_path(&path_text).into_iter().filter_map(|id| {
                 let node = graph.get_node(id).ok()?;
                 (node.properties.get_string("kind") == Some("table"))
                     .then(|| node.properties.get_string("name"))
                     .flatten()
-                    .map(|name| (normalize_name(name), id))
-            })
-            .collect();
+                    .map(|name| (sql_relation_key(name, node.properties.get_string("sql_schema")), id))
+            }) {
+            table_ids.entry(key).and_modify(|entry| *entry = None).or_insert(Some(id));
+        }
         for directive in key_directives {
             let directive_id = graph
                 .add_node(
@@ -726,22 +765,24 @@ impl SqlParser {
                 )
                 .map_err(|error| ParserError::GraphError(error.to_string()))?;
 
-            let normalized = normalize_name(&directive.table);
-            let target_id = match table_ids.get(&normalized).copied() {
+            let schema = sql_schema_at_line(&schema_changes, directive.line);
+            let normalized = sql_relation_key(&directive.table, schema);
+            let target_id = match table_ids.get(&normalized).filter(|_| schema != Some("")).copied().flatten() {
                 Some(id) => id,
                 None => {
                     let id = graph
                         .add_node(
                             NodeType::Generic,
-                            sql_node_properties(
+                            sql_relation_properties(
                                 path,
                                 &directive.table,
                                 "table_reference",
                                 directive.line,
+                                schema,
                             ),
                         )
                         .map_err(|error| ParserError::GraphError(error.to_string()))?;
-                    table_ids.insert(normalized, id);
+                    if schema != Some("") { table_ids.entry(normalized).or_insert(Some(id)); }
                     id
                 }
             };
@@ -776,17 +817,18 @@ impl SqlParser {
                 )
                 .map_err(|error| ParserError::GraphError(error.to_string()))?;
 
-            let normalized = normalize_name(&table_name);
-            let target_id = match table_ids.get(&normalized).copied() {
+            let schema = sql_schema_at_line(&schema_changes, insert_line);
+            let normalized = sql_relation_key(&table_name, schema);
+            let target_id = match table_ids.get(&normalized).filter(|_| schema != Some("")).copied().flatten() {
                 Some(id) => id,
                 None => {
                     let id = graph
                         .add_node(
                             NodeType::Generic,
-                            sql_node_properties(path, &table_name, "table_reference", insert_line),
+                            sql_relation_properties(path, &table_name, "table_reference", insert_line, schema),
                         )
                         .map_err(|error| ParserError::GraphError(error.to_string()))?;
-                    table_ids.insert(normalized, id);
+                    if schema != Some("") { table_ids.entry(normalized).or_insert(Some(id)); }
                     id
                 }
             };
@@ -1961,7 +2003,8 @@ fn add_mysql_multi_table_update_nodes(
     file_id: NodeId,
     file_path: &Path,
     updates: Vec<MysqlMultiTableUpdate>,
-    defined_nodes: &mut HashMap<String, NodeId>,
+    defined_nodes: &mut HashMap<String, Option<NodeId>>,
+    schema_changes: &[(usize, Option<String>)],
 ) -> ParserResult<()> {
     for update in updates {
         let update_id = graph
@@ -1984,17 +2027,18 @@ fn add_mysql_multi_table_update_nodes(
             .add_edge(file_id, update_id, EdgeType::Contains, PropertyMap::new())
             .map_err(|error| ParserError::GraphError(error.to_string()))?;
         for (table, line) in update.table_references {
-            let key = normalize_name(&table);
-            let table_id = if let Some(id) = defined_nodes.get(&key) {
+            let schema = sql_schema_at_line(schema_changes, line);
+            let key = sql_relation_key(&table, schema);
+            let table_id = if let Some(Some(id)) = defined_nodes.get(&key).filter(|_| schema != Some("")) {
                 *id
             } else {
                 let id = graph
                     .add_node(
                         NodeType::Generic,
-                        sql_node_properties(file_path, &table, "table_reference", line),
+                        sql_relation_properties(file_path, &table, "table_reference", line, schema),
                     )
                     .map_err(|error| ParserError::GraphError(error.to_string()))?;
-                defined_nodes.insert(key, id);
+                if schema != Some("") { defined_nodes.entry(key).or_insert(Some(id)); }
                 id
             };
             graph
@@ -2948,6 +2992,53 @@ fn sql_node_properties(path: &Path, name: &str, kind: &str, line: usize) -> Prop
         .with("line_start", i64::try_from(line).unwrap_or(0))
 }
 
+fn simple_sql_identifier(value: &str) -> Option<String> {
+    let value = value.trim().trim_matches('`');
+    (!value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$'))
+        .then(|| value.to_ascii_lowercase())
+}
+
+pub(crate) fn sql_relation_parts(name: &str, current: Option<&str>) -> Option<(Option<String>, String)> {
+    let parts: Vec<_> = name.split('.').collect();
+    match parts.as_slice() {
+        [table] => Some((current.map(str::to_owned), simple_sql_identifier(table)?)),
+        [schema, table] => Some((Some(simple_sql_identifier(schema)?), simple_sql_identifier(table)?)),
+        _ => None,
+    }
+}
+
+fn sql_relation_key(name: &str, current: Option<&str>) -> String {
+    match sql_relation_parts(name, current) {
+        Some((Some(schema), table)) if schema.is_empty() => format!("?\0{table}"),
+        Some((schema, table)) => format!("{}\0{table}", schema.unwrap_or_default()),
+        None => format!("!{}\0{}", current.unwrap_or_default(), name.to_ascii_lowercase()),
+    }
+}
+
+fn sql_relation_properties(path: &Path, name: &str, kind: &str, line: usize, current: Option<&str>) -> PropertyMap {
+    let properties = sql_node_properties(path, name, kind, line);
+    match sql_relation_parts(name, current) {
+        Some((Some(schema), _)) => properties.with("sql_schema", schema),
+        _ => properties,
+    }
+}
+
+fn sql_schema_at_line(changes: &[(usize, Option<String>)], line: usize) -> Option<&str> {
+    if line == 0 { return (!changes.is_empty()).then_some(""); }
+    let mut current = None;
+    let mut i = 0;
+    while i < changes.len() {
+        let (change_line, schema) = &changes[i];
+        if *change_line == 0 || *change_line == line { return Some(""); }
+        if *change_line > line { break; }
+        let mut next = i + 1;
+        while next < changes.len() && changes[next].0 == *change_line { next += 1; }
+        current = if next - i > 1 { Some("") } else { schema.as_deref() };
+        i = next;
+    }
+    current
+}
+
 fn normalize_name(name: &str) -> String {
     name.trim_matches('`').to_ascii_lowercase()
 }
@@ -2978,6 +3069,102 @@ mod tests {
 
     fn graph() -> CodeGraph {
         CodeGraph::in_memory().unwrap()
+    }
+
+    #[test]
+    fn schema_switches_and_ambiguous_definitions_do_not_cross_link() {
+        let parser = SqlParser::with_config(ParserConfig::default());
+        let mut graph = graph();
+        parser.parse_source(
+            "USE alpha;\nCREATE TABLE item (id INT);\nSELECT * FROM item;\nUSE beta;\nCREATE TABLE item (id INT);\nSELECT * FROM item;\nSELECT * FROM `alpha`.`item`;\nCREATE TABLE repeated (id INT);\nCREATE TABLE repeated (id INT);\nSELECT * FROM repeated;",
+            Path::new("schema-switch.sql"), &mut graph,
+        ).unwrap();
+        let table = |name: &str, schema: &str| graph.iter_nodes().filter(|(_, n)|
+            n.properties.get_string("kind") == Some("table") &&
+            n.properties.get_string("name") == Some(name) &&
+            n.properties.get_string("sql_schema") == Some(schema))
+            .map(|(id, _)| id).collect::<Vec<_>>();
+        let alpha = table("item", "alpha")[0];
+        let beta = table("item", "beta")[0];
+        let duplicate = table("repeated", "beta");
+        assert_eq!(duplicate.len(), 2);
+        let ref_nodes = graph.iter_nodes().filter(|(_, n)| n.properties.get_string("kind") == Some("table_reference") && n.properties.get_string("name") == Some("repeated")).map(|(id, _)| id).collect::<Vec<_>>();
+        assert_eq!(ref_nodes.len(), 1);
+        for d in duplicate { assert!(graph.get_edges_between(ref_nodes[0], d).unwrap().is_empty()); }
+        let mut statement_targets = Vec::new();
+        for (id, n) in graph.iter_nodes() {
+            if n.properties.get_string("kind") != Some("statement") { continue; }
+            let line = n.properties.get_int("line_start").unwrap_or(0);
+            if (line == 3 || line == 6 || line == 7) && !graph.get_edges_between(id, alpha).unwrap().is_empty() { statement_targets.push((line, "alpha")); }
+            if (line == 3 || line == 6 || line == 7) && !graph.get_edges_between(id, beta).unwrap().is_empty() { statement_targets.push((line, "beta")); }
+        }
+        statement_targets.sort();
+        assert_eq!(statement_targets, vec![(3, "alpha"), (6, "beta"), (7, "alpha")]);
+    }
+
+    #[test]
+    fn streamed_bulk_inserts_keep_their_use_schema() {
+        let parser = SqlParser::with_config(ParserConfig::default().with_max_file_size(32));
+        let mut graph = graph();
+        let mut file = tempfile::NamedTempFile::with_suffix(".sql").unwrap();
+        std::io::Write::write_all(&mut file, b"USE alpha;\nCREATE TABLE item (id INT);\nINSERT INTO item VALUES (1),(2);\nUSE beta;\nCREATE TABLE item (id INT);\nINSERT INTO item VALUES (3),(4);\n").unwrap();
+        parser.parse_file(file.path(), &mut graph).unwrap();
+        let mut inserts = graph.iter_nodes().filter(|(_, n)| n.properties.get_string("kind") == Some("bulk_insert"))
+            .map(|(id, n)| (n.properties.get_int("line_start").unwrap_or(0), id)).collect::<Vec<_>>();
+        inserts.sort();
+        assert_eq!(inserts.len(), 2);
+        for ((_, insert), expected) in inserts.into_iter().zip(["alpha", "beta"]) {
+            let targets = graph.get_neighbors_by_edge_type(insert, Direction::Outgoing, EdgeType::References).unwrap();
+            assert_eq!(targets.len(), 1);
+            assert_eq!(graph.get_node(targets[0]).unwrap().properties.get_string("sql_schema"), Some(expected));
+        }
+    }
+
+    #[test]
+    fn streamed_same_line_use_fails_closed() {
+        let parser = SqlParser::with_config(ParserConfig::default().with_max_file_size(32));
+        let mut graph = graph();
+        let mut file = tempfile::NamedTempFile::with_suffix(".sql").unwrap();
+        std::io::Write::write_all(&mut file, b"CREATE TABLE item (id INT);\nUSE beta; INSERT INTO item VALUES (1),(2);\n").unwrap();
+        parser.parse_file(file.path(), &mut graph).unwrap();
+        let insert = graph.iter_nodes().find(|(_, n)| n.properties.get_string("kind") == Some("bulk_insert")).unwrap().0;
+        let targets = graph.get_neighbors_by_edge_type(insert, Direction::Outgoing, EdgeType::References).unwrap();
+        assert_eq!(targets.len(), 1);
+        let target = graph.get_node(targets[0]).unwrap();
+        assert_eq!(target.properties.get_string("kind"), Some("table_reference"));
+        assert_eq!(target.properties.get_string("sql_schema"), Some(""));
+    }
+
+    #[test]
+    fn unordered_same_line_schema_changes_remain_unknown_until_next_use() {
+        let changes = vec![(2, Some("alpha".to_string())), (2, Some("beta".to_string())), (4, Some("gamma".to_string()))];
+        assert_eq!(sql_schema_at_line(&changes, 3), Some(""));
+        assert_eq!(sql_schema_at_line(&changes, 5), Some("gamma"));
+    }
+
+    #[test]
+    fn unknown_use_contexts_never_share_local_definitions() {
+        let parser = SqlParser::with_config(ParserConfig::default());
+        let mut graph = graph();
+        parser.parse_source("USE `one.bad`;\nCREATE TABLE item (id INT);\nUSE `two.bad`;\nSELECT * FROM item;", Path::new("unknown.sql"), &mut graph).unwrap();
+        let reference = graph.iter_nodes().find(|(_, n)| n.properties.get_string("kind") == Some("table_reference") && n.properties.get_string("name") == Some("item")).unwrap();
+        assert_eq!(reference.1.properties.get_string("sql_schema"), Some(""));
+    }
+
+    #[test]
+    fn mysql_key_directives_keep_schema_after_use_changes() {
+        let parser = SqlParser::with_config(ParserConfig::default());
+        let mut graph = graph();
+        parser.parse_source("USE alpha;\nCREATE TABLE item (id INT);\nALTER TABLE item DISABLE KEYS;\nUSE beta;\nCREATE TABLE item (id INT);\nALTER TABLE item DISABLE KEYS;", Path::new("keys.sql"), &mut graph).unwrap();
+        let mut directives = graph.iter_nodes().filter(|(_, n)| n.properties.get_string("kind") == Some("mysql_key_directive"))
+            .map(|(id, n)| (n.properties.get_int("line_start").unwrap_or(0), id)).collect::<Vec<_>>();
+        directives.sort();
+        assert_eq!(directives.len(), 2);
+        for ((_, directive), expected) in directives.into_iter().zip(["alpha", "beta"]) {
+            let targets = graph.get_neighbors_by_edge_type(directive, Direction::Outgoing, EdgeType::References).unwrap();
+            assert_eq!(targets.len(), 1);
+            assert_eq!(graph.get_node(targets[0]).unwrap().properties.get_string("sql_schema"), Some(expected));
+        }
     }
 
     #[test]
