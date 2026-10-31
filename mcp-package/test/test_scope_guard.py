@@ -65,6 +65,16 @@ class ScopeGuardTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             check_scope('/state/codegraph-operations', self.args, self.config, {'CODEGRAPH_CALL_SCOPE_MAP': 'bad'})
 
+    def test_sql_schema_map_is_part_of_persistent_scope(self):
+        env = self.config['mcp_servers']['codegraph-operations']['env']
+        env['CODEGRAPH_SQL_SCHEMA_MAP'] = '{"/cms":{"aliases":{"site":"site"},"default_files":{"/cms/u.sql":"site"},"definition_files":["/cms/base.sql"]}}'
+        self.assertTrue(check_scope('/state/codegraph-operations', self.args, self.config, dict(env)))
+        different = dict(env, CODEGRAPH_SQL_SCHEMA_MAP='{"/cms":{"aliases":{"site":"db_world"}}}')
+        self.assertFalse(check_scope('/state/codegraph-operations', self.args, self.config, different))
+        for invalid in ('[]', '{"/cms":{"aliases":[]}}', '{"/cms":{"definition_files":[]}}'):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                check_scope('/state/codegraph-operations', self.args, self.config, dict(env, CODEGRAPH_SQL_SCHEMA_MAP=invalid))
+
     def test_cpp_override_is_part_of_persistent_scope(self):
         with_cpp = self.args + ['--include-cpp-file', '/project/fragment.inc']
         self.config['mcp_servers']['codegraph-operations']['args'] = with_cpp

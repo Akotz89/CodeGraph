@@ -33,6 +33,20 @@ def resolution_maps(environment):
         if not isinstance(value, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in value.items()):
             raise ValueError(f'{key} must be a JSON object of strings')
         result.append(value)
+    schemas = json.loads(environment.get('CODEGRAPH_SQL_SCHEMA_MAP') or '{}')
+    if not isinstance(schemas, dict):
+        raise ValueError('CODEGRAPH_SQL_SCHEMA_MAP must be a JSON object')
+    for root, config in schemas.items():
+        if not isinstance(root, str) or not isinstance(config, dict) or 'aliases' not in config or set(config) - {'aliases', 'default_files', 'definition_files'}:
+            raise ValueError('Invalid SQL schema root configuration')
+        for key in ('aliases', 'default_files'):
+            value = config.get(key, {})
+            if not isinstance(value, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in value.items()):
+                raise ValueError(f'SQL schema {key} must be an object of strings')
+        definitions = config.get('definition_files', [])
+        if not isinstance(definitions, list) or any(not isinstance(path, str) for path in definitions):
+            raise ValueError('SQL schema definition_files must be a list of strings')
+    result.append(schemas)
     return result
 
 

@@ -179,6 +179,26 @@ the corresponding configured `codegraph-*` MCP server. The guard rejects
 scope mismatches before launching the executable. It does not protect direct
 server invocations or enforce configuration in other processes.
 
+### Optional SQL schema mapping
+
+For SQL outside the standard `data/sql` layout, opt in with the JSON environment
+variable `CODEGRAPH_SQL_SCHEMA_MAP`. Each absolute root has schema `aliases`,
+optional per-file defaults for SQL without `USE`, and exact canonical definition
+files. The same root must have an explicit group in `CODEGRAPH_SQL_SCOPE_MAP`;
+roots share cross-repository links only when their scope groups match. Example:
+
+```json
+{"/workspace/site":{"aliases":{"site":"site","auth_db":"db_auth"},"default_files":{"/workspace/site/update.sql":"site"},"definition_files":["/workspace/site/base.sql"]}}
+```
+
+Unknown schemas, missing defaults, and duplicate definitions stay unlinked. Do
+not list migration files as canonical definitions unless they are authoritative
+for that database. Qualified names and `USE` are scoped; dynamic SQL and
+partially parsed routines still have the coverage limits reported by the parser.
+The guard treats this mapping as part of a saved graph's scope.
+The existing `data/sql` resolver continues to infer database identity from its
+path unless the root is explicitly configured with this schema mapping.
+
 ## Source coverage audit
 
 `codegraph-audit-source-coverage` compares tracked, source-like files in the
