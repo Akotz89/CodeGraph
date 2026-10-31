@@ -12,7 +12,7 @@ use codegraph_c::CParser;
 use codegraph_clojure::ClojureParser;
 #[cfg(feature = "extra-languages")]
 use codegraph_cobol::CobolParser;
-use codegraph_cpp::CppParser;
+use codegraph_cpp::{has_cpp_header_syntax, CppParser};
 use codegraph_csharp::CSharpParser;
 use codegraph_css::CssParser;
 #[cfg(feature = "extra-languages")]
@@ -287,7 +287,8 @@ impl ParserRegistry {
 
     /// Find appropriate parser for a file path.
     ///
-    /// Note: C is checked before C++ so `.h` files default to C parsing.
+    /// Path-only selection defaults ambiguous `.h` files to C; content-aware
+    /// selection occurs during parsing. Exact C++ overrides take precedence.
     /// C++-specific extensions (`.hpp`, `.cc`, `.cxx`, `.hh`, `.hxx`) are
     /// only claimed by the C++ parser and resolve correctly.
     pub fn parser_for_path(&self, path: &Path) -> Option<Arc<dyn CodeParser>> {
@@ -473,9 +474,18 @@ impl ParserRegistry {
 
     /// Parse a file using the appropriate parser.
     pub fn parse_file(&self, path: &Path, graph: &mut CodeGraph) -> Result<FileInfo, ParserError> {
-        let parser = self.parser_for_path(path).ok_or_else(|| {
+        let mut parser = self.parser_for_path(path).ok_or_else(|| {
             ParserError::UnsupportedFeature(path.to_path_buf(), "Unsupported file type".to_string())
         })?;
+        if path.extension().is_some_and(|ext| ext == "h") && !self.is_exact_cpp_file(path) {
+            let metadata = std::fs::metadata(path).map_err(|error| ParserError::IoError(path.to_path_buf(), error))?;
+            if metadata.len() <= parser.config().max_file_size as u64 {
+                let bytes = std::fs::read(path).map_err(|error| ParserError::IoError(path.to_path_buf(), error))?;
+                let source = codegraph_parser_api::decode_source_bytes(&bytes)
+                    .map_err(|error| ParserError::IoError(path.to_path_buf(), error))?;
+                parser = self.parser_for_source(&source, path).unwrap();
+            }
+        }
 
         if extensionless_source_kind(path) == Some("python") {
             let metadata = std::fs::metadata(path).map_err(|error| ParserError::IoError(path.to_path_buf(), error))?;
@@ -489,6 +499,19 @@ impl ParserRegistry {
         parser.parse_file(path, graph)
     }
 
+    /// Select a parser for an in-memory source buffer, which may differ from disk.
+    pub fn parser_for_source(&self, source: &str, path: &Path) -> Option<Arc<dyn CodeParser>> {
+        if path.extension().is_some_and(|ext| ext == "h") {
+            if self.is_exact_cpp_file(path) || has_cpp_header_syntax(source) {
+                Some(self.cpp.clone())
+            } else {
+                Some(self.c.clone())
+            }
+        } else {
+            self.parser_for_path(path)
+        }
+    }
+
     /// Parse source code string using the appropriate parser for the given path.
     pub fn parse_source(
         &self,
@@ -496,19 +519,29 @@ impl ParserRegistry {
         path: &Path,
         graph: &mut CodeGraph,
     ) -> Result<FileInfo, ParserError> {
-        let parser = self.parser_for_path(path).ok_or_else(|| {
+        let parser = self.parser_for_source(source, path).ok_or_else(|| {
             ParserError::UnsupportedFeature(path.to_path_buf(), "Unsupported file type".to_string())
         })?;
-
         parser.parse_source(source, path, graph)
     }
 
     /// Get language name for a file path.
     ///
-    /// Note: `.h` files return `"c"` by convention (C-compatible headers).
-    /// Use `.hpp`/`.hh`/`.hxx` for C++ headers.
+    /// Ambiguous headers default to C unless recognizable C++ syntax or an
+    /// exact override selects C++.
     pub fn language_for_path(&self, path: &Path) -> Option<&'static str> {
         if self.is_exact_cpp_file(path) { return Some("cpp"); }
+        if path.extension().is_some_and(|ext| ext == "h") {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                if metadata.len() <= self.cpp.config().max_file_size as u64 {
+                    if let Ok(bytes) = std::fs::read(path) {
+                        if let Ok(source) = codegraph_parser_api::decode_source_bytes(&bytes) {
+                            if has_cpp_header_syntax(&source) { return Some("cpp"); }
+                        }
+                    }
+                }
+            }
+        }
         if let Some(kind) = source_template_kind(path) { return Some(kind); }
         if self.build.can_parse(path) {
             return Some(match path.extension().and_then(|e| e.to_str()) {
@@ -662,6 +695,28 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn ambiguous_headers_use_cpp_only_for_recognizable_cpp_syntax() {
+        let temp = tempfile::tempdir().unwrap();
+        let cpp = temp.path().join("cache.h");
+        let c = temp.path().join("api.h");
+        std::fs::write(&cpp, "template <typename T> class Cache { public: T value; };\n").unwrap();
+        std::fs::write(&c, "/* class and namespace are documentation */\n#ifdef __cplusplus\nextern \"C\" {\n#endif\nstruct CRecord { int value; };\n#ifdef __cplusplus\n}\n#endif\n").unwrap();
+        let registry = ParserRegistry::new();
+        // Path-only admission must stay cheap for unchanged files.
+        assert_eq!(registry.parser_for_path(&cpp).unwrap().language(), "c");
+        assert_eq!(registry.language_for_path(&cpp), Some("cpp"));
+        assert_eq!(registry.language_for_path(&c), Some("c"));
+        let mut graph = CodeGraph::in_memory().unwrap();
+        registry.parse_file(&cpp, &mut graph).unwrap();
+        registry.parse_file(&c, &mut graph).unwrap();
+        assert!(graph.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("Cache") && node.properties.get_string("path") == cpp.to_str()));
+        assert!(graph.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("CRecord") && node.properties.get_string("path") == c.to_str()));
+        let mut unsaved = CodeGraph::in_memory().unwrap();
+        registry.parse_source("namespace sample { class Scratch {}; }", Path::new("unsaved.h"), &mut unsaved).unwrap();
+        assert!(unsaved.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("sample::Scratch")));
+    }
 
     #[test]
     fn test_parser_registry_new() {

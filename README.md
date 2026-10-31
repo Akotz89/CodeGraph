@@ -110,6 +110,10 @@ Pass `--split-identifiers=false` to keep the old behaviour.
 
 Example: `CODEGRAPH_CALL_SCOPE_MAP='{"/project/core":"server","/project/modules":"server","/project/old":"archive"}'`
 
+### C and C++ headers
+
+`.h` files use C++ parsing when their syntax contains recognizable C++ constructs; otherwise they default to C. Explicit C++ file overrides remain available for ambiguous headers. Existing saved graphs can skip unchanged headers after a parser upgrade, so use a fresh state or a verified forced reindex to apply the new routing.
+
 ### MCP Server flags
 
 | Flag | Default | Description |

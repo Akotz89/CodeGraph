@@ -208,14 +208,15 @@ impl FileWatcher {
         path: &Path,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         validate_call_scope_configuration()?;
-        // Skip non-parseable files
-        let parser = match parsers.parser_for_path(path) {
+        if !parsers.can_parse(path) {
+            return Ok(());
+        }
+        // Read file content and select its parser from the same bytes.
+        let content = tokio::fs::read_to_string(path).await?;
+        let parser = match parsers.parser_for_source(&content, path) {
             Some(p) => p,
             None => return Ok(()),
         };
-
-        // Read file content
-        let content = tokio::fs::read_to_string(path).await?;
 
         let path_str = path.to_string_lossy().to_string();
         let node_id_strings: Vec<String>;
@@ -351,7 +352,7 @@ impl GraphUpdater {
         let mut graph_guard = graph.write().await;
 
         for (path, content) in files {
-            if let Some(parser) = parsers.parser_for_path(path) {
+            if let Some(parser) = parsers.parser_for_source(content, path) {
                 // Remove old nodes
                 let path_str = path.to_string_lossy().to_string();
                 if let Ok(nodes) = graph_guard.query().property("path", path_str).execute() {
@@ -1043,6 +1044,24 @@ mod tests {
         };
         // 2/3 = 0.6666...
         assert!((result.success_rate() - (2.0 / 3.0)).abs() < 0.0001);
+    }
+
+    #[tokio::test]
+    async fn batch_header_uses_buffer_not_stale_disk_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mixed.h");
+        std::fs::write(&path, "struct OldC { int value; };\n").unwrap();
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        let parsers = Arc::new(ParserRegistry::new());
+        let result = GraphUpdater::update_files(&graph, &parsers, &[(path.clone(), "class EditedCpp {};".into())]).await.unwrap();
+        assert!(result.all_succeeded());
+        assert!(graph.read().await.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("EditedCpp")));
+        std::fs::write(&path, "class DiskCpp {};\n").unwrap();
+        let result = GraphUpdater::update_files(&graph, &parsers, &[(path, "struct EditedC { int value; };".into())]).await.unwrap();
+        assert!(result.all_succeeded());
+        let graph = graph.read().await;
+        assert!(graph.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("EditedC")));
+        assert!(!graph.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("EditedCpp")));
     }
 
     #[tokio::test]

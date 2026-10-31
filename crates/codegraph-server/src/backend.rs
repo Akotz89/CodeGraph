@@ -425,7 +425,7 @@ impl CodeGraphBackend {
             self.client.log_message(MessageType::ERROR, format!("Cannot index source: {error}")).await;
             return false;
         }
-        let Some(parser) = self.parsers.parser_for_path(path) else {
+        let Some(parser) = self.parsers.parser_for_source(text, path) else {
             tracing::warn!("No parser found for: {:?}", path);
             return false;
         };
@@ -4426,6 +4426,22 @@ mod tests {
     fn test_backend_creation() {
         let backend = create_test_backend();
         assert!(backend.file_cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn editor_header_uses_unsaved_content_not_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mixed.h");
+        std::fs::write(&path, "struct OldC { int value; };\n").unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+        let backend = create_test_backend();
+        assert!(backend.index_source(&uri, &path, "class EditedCpp {};", EmbedMode::Skip).await);
+        assert!(backend.graph.read().await.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("EditedCpp")));
+        std::fs::write(&path, "class DiskCpp {};\n").unwrap();
+        assert!(backend.index_source(&uri, &path, "struct EditedC { int value; };", EmbedMode::Skip).await);
+        let graph = backend.graph.read().await;
+        assert!(graph.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("EditedC")));
+        assert!(!graph.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("EditedCpp")));
     }
 
     #[tokio::test]

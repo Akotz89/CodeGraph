@@ -39,3 +39,38 @@ mod sql_references;
 mod visitor;
 
 pub use parser_impl::CppParser;
+
+/// Recognize constructs that require the C++ grammar in an ambiguous header.
+/// Headers without such syntax remain ambiguous and should retain their default language.
+pub fn has_cpp_header_syntax(source: &str) -> bool {
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&tree_sitter_cpp::LANGUAGE.into()).is_err() {
+        return false;
+    }
+    let Some(tree) = parser.parse(source, None) else { return false };
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind(), "class_specifier" | "template_declaration" | "namespace_definition"
+            | "namespace_alias_definition" | "using_declaration" | "alias_declaration"
+            | "concept_definition" | "qualified_identifier") {
+            return true;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.children(&mut cursor));
+    }
+    false
+}
+
+#[cfg(test)]
+mod header_syntax_tests {
+    use super::has_cpp_header_syntax;
+
+    #[test]
+    fn identifies_cpp_syntax_without_matching_c_comments_or_linkage() {
+        assert!(has_cpp_header_syntax("template <typename T> class Cache {};"));
+        assert!(has_cpp_header_syntax("namespace n { using Value = int; }"));
+        assert!(has_cpp_header_syntax("std::string name;"));
+        assert!(!has_cpp_header_syntax("/* class Cache {}; namespace n {} */\nstruct CRecord { int value; };"));
+        assert!(!has_cpp_header_syntax("#ifdef __cplusplus\nextern \"C\" {\n#endif\nint f(void);\n#ifdef __cplusplus\n}\n#endif"));
+    }
+}
