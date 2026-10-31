@@ -107,6 +107,46 @@ pub(crate) fn is_excluded_entry(
             || exclude_set.is_match(name.as_ref()))
 }
 
+/// External directories are retained only when explicitly added and still allowed.
+pub(crate) fn external_root_allowed(root: &Path, config: &IndexConfig) -> bool {
+    let Ok(canonical) = root.canonicalize() else { return false; };
+    if !root.is_absolute() || canonical != root || !canonical.is_dir() { return false; }
+    let mut scoped = config.clone();
+    scoped.extend_from_codegraphignore(root);
+    let exclude_set = scoped.build_exclude_set();
+    let temp = std::env::temp_dir();
+    let resolved_temp = temp.canonicalize().unwrap_or_else(|_| temp.clone());
+    !root.ancestors().chain(canonical.ancestors()).any(|ancestor| {
+        exclude_set.is_match(ancestor) || ancestor.file_name().is_some_and(|name| {
+            exclude_set.is_match(name)
+                || (ancestor != temp && ancestor != resolved_temp
+                    && scoped.exclude_dirs.iter().any(|excluded| name == std::ffi::OsStr::new(excluded)))
+        })
+    })
+}
+
+pub(crate) fn authorized_external_roots(graph: &CodeGraph, config: &IndexConfig) -> Result<Vec<PathBuf>, String> {
+    let mut roots = Vec::new();
+    for (_, node) in graph.iter_nodes() {
+        if let Some(root) = node.properties.get_string("codegraph_external_root") {
+            let root = PathBuf::from(root);
+            if !external_root_allowed(&root, config) || std::fs::read_dir(&root).is_err() {
+                return Err("Cannot verify authorized external directory".into());
+            }
+            if !roots.contains(&root) { roots.push(root); }
+        }
+    }
+    Ok(roots)
+}
+
+pub(crate) fn external_filter(roots: &[PathBuf], config: &IndexConfig) -> WorkspaceFilter {
+    let mut config = config.clone();
+    config.explicit_source_files.clear();
+    config.filename_exception_files.clear();
+    config.exact_cpp_files.clear();
+    WorkspaceFilter::new(roots, &config)
+}
+
 /// Decides whether the file watcher may admit a path, by the same rule the
 /// indexer used to build the graph.
 ///
@@ -150,6 +190,10 @@ impl WorkspaceFilter {
             explicit_files,
             exact_cpp_files: base.exact_cpp_files.iter().cloned().collect(),
         }
+    }
+
+    pub(crate) fn covers(&self, path: &Path) -> bool {
+        self.locate(path).is_some()
     }
 
     pub(crate) fn explicit_source_files(&self) -> Vec<PathBuf> {
@@ -317,12 +361,23 @@ impl WorkspaceFilter {
         if components.len().saturating_sub(1) > config.max_depth as usize {
             return false;
         }
+        let filename_exception = canonical_candidate(path).is_some_and(|candidate| {
+            config.filename_exception_files.iter().any(|selected| canonical_candidate(selected).as_ref() == Some(&candidate))
+        });
         let mut current = root.to_path_buf();
         for (index, component) in components.iter().enumerate() {
             current.push(component);
             let name = component.as_os_str().to_string_lossy();
             let is_dir = index + 1 < components.len();
-            if name.starts_with('.') || exclude_set.is_match(&current) {
+            let leaf_exception = !is_dir && filename_exception;
+            let excluded = if leaf_exception {
+                let mut strict = config.clone();
+                strict.exclude_patterns.retain(|pattern| pattern != "**/*secret*" && pattern != "**/*credential*");
+                strict.build_exclude_set().is_match(&current)
+            } else {
+                exclude_set.is_match(&current)
+            };
+            if name.starts_with('.') || excluded {
                 return false;
             }
             if is_dir
@@ -331,6 +386,9 @@ impl WorkspaceFilter {
                     .iter()
                     .any(|excluded| excluded == name.as_ref())
             {
+                if filename_exception {
+                    return false;
+                }
                 if (name == "fixtures" && ext == "json") || (name == "logs" && ext == "php") {
                     // Only the exact source file is admitted; siblings stay pruned.
                     continue;
@@ -491,6 +549,8 @@ pub struct IndexConfig {
     pub explicit_source_files: Vec<PathBuf>,
     /// Exact paths explicitly declared to be C++ despite an ambiguous suffix.
     pub exact_cpp_files: Vec<PathBuf>,
+    /// Exact source paths allowed to bypass only the two filename globs.
+    pub filename_exception_files: Vec<PathBuf>,
     /// Extensions supported by the caller's parser registry, without dots.
     pub explicit_source_extensions: Vec<String>,
 }
@@ -505,6 +565,7 @@ impl Default for IndexConfig {
             max_files: 5_000,
             explicit_source_files: Vec::new(),
             exact_cpp_files: Vec::new(),
+            filename_exception_files: Vec::new(),
             explicit_source_extensions: Vec::new(),
         }
     }
@@ -1200,6 +1261,61 @@ impl Indexer {
                         tracing::warn!("Failed to index explicit source file: {error}");
                         *result.parser_errors_by_language.entry("explicit-source".to_string()).or_default() += 1;
                     },
+                }
+            }
+        }
+
+        // Revoke previously indexed paths when current workspace exclusions change.
+        let filter = WorkspaceFilter::new(folders, config);
+        let external_roots = match authorized_external_roots(&*graph.read().await, config) {
+            Ok(roots) => roots,
+            Err(error) => { result.resolution_error = Some(error); Vec::new() }
+        };
+        let external = external_filter(&external_roots, config);
+        let graph_paths: std::collections::HashSet<PathBuf> = {
+            let graph = graph.read().await;
+            graph.iter_nodes().filter_map(|(_, node)| node.properties.get_string("path").map(PathBuf::from)).collect()
+        };
+        let mut indexed_paths = graph_paths.clone();
+        {
+            let state = self.index_state.lock().await;
+            indexed_paths.extend(state.all_hashes().keys().cloned());
+        }
+        let mut excluded = Vec::new();
+        for path in indexed_paths {
+            if let Some((root, _, _, _)) = filter.locate(&path) {
+                if std::fs::read_dir(root).is_err() {
+                    if graph_paths.contains(&path) { result.resolution_error = Some("Cannot verify indexed paths in an inaccessible workspace".into()); }
+                } else if !filter.admits(&path) {
+                    excluded.push(path);
+                }
+            } else if let Some((root, _, _, _)) = external.locate(&path) {
+                if std::fs::read_dir(root).is_err() {
+                    if graph_paths.contains(&path) { result.resolution_error = Some("Cannot verify indexed paths in an inaccessible external directory".into()); }
+                } else if !external.admits(&path) {
+                    excluded.push(path);
+                }
+            } else if graph_paths.contains(&path) {
+                result.resolution_error = Some("Indexed graph contains a path outside the configured workspaces".into());
+            }
+        }
+        {
+            let mut g = graph.write().await;
+            let mut state = self.index_state.lock().await;
+            for path in excluded {
+                if filter.admits(&path) || (!filter.covers(&path) && external.admits(&path)) { continue; }
+                let mut deleted = true;
+                for id in g.nodes_by_path(&path.to_string_lossy()) {
+                    if let Err(error) = g.delete_node(id) {
+                        tracing::warn!("Failed to remove excluded path from graph: {}", error);
+                        deleted = false;
+                    }
+                }
+                if deleted {
+                    state.remove(&path);
+                    result.files_removed += 1;
+                } else {
+                    result.resolution_error = Some("Failed to remove excluded path from graph".into());
                 }
             }
         }
@@ -2061,6 +2177,7 @@ mod tests {
             max_files: 1000,
             explicit_source_files: vec![],
             exact_cpp_files: vec![],
+            filename_exception_files: vec![],
             explicit_source_extensions: vec![],
         }
     }
@@ -2231,6 +2348,101 @@ mod tests {
         let mut excluded = config.clone();
         excluded.exclude_patterns.push("**/index.php".into());
         assert!(!WorkspaceFilter::new(&[root], &excluded).admits(&selected));
+    }
+
+    #[test]
+    fn filename_exceptions_never_bypass_excluded_parent_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (dir, name) in [("logs", "credential.php"), ("fixtures", "credential.json"),
+            ("examples", "credential.sh"), ("dist", "credential.sh"), ("bin", "credential")] {
+            let path = root.join(dir).join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "#!/bin/sh\necho test\n").unwrap();
+            let mut config = IndexConfig::default();
+            if !config.exclude_dirs.iter().any(|entry| entry == dir) { config.exclude_dirs.push(dir.into()); }
+            config.explicit_source_extensions = vec!["php".into(), "json".into(), "sh".into()];
+            config.explicit_source_files = vec![path.clone()];
+            assert!(WorkspaceFilter::new(&[root.to_path_buf()], &config).admits(&path), "legacy include {dir}");
+            config.exclude_patterns.push("**/*credential*".into());
+            config.filename_exception_files.push(path.clone());
+            assert!(!WorkspaceFilter::new(&[root.to_path_buf()], &config).admits(&path), "exception {dir}");
+        }
+    }
+
+    #[tokio::test]
+    async fn filename_exceptions_are_exact_and_keep_other_protections() {
+        let tmp = tempfile::Builder::new().prefix("codegraph-harness-").tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let selected = root.join("source_secret.rs");
+        let sibling = root.join("other_secret.rs");
+        let mixed = root.join("blocked_credential.rs");
+        let hidden = root.join(".private/hidden_secret.rs");
+        let private = root.join("private/private_secret.rs");
+        let unsupported = root.join("source_secret.pem");
+        let oversized = root.join("oversized_secret.rs");
+        for path in [&selected, &sibling, &mixed, &hidden, &private, &unsupported, &oversized] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "pub fn selected_marker() {}\n").unwrap();
+        }
+        let mut config = IndexConfig::default();
+        config.explicit_source_extensions = vec!["rs".into()];
+        config.exclude_dirs.push("private".into());
+        config.exclude_patterns.extend(["**/*secret*".into(), "**/*credential*".into(), "**/blocked_*".into()]);
+        std::fs::OpenOptions::new().write(true).open(&oversized).unwrap().set_len(config.max_file_size_bytes + 1).unwrap();
+        config.explicit_source_files = vec![selected.clone(), mixed.clone(), hidden.clone(), private.clone(), unsupported.clone(), oversized.clone()];
+        let baseline = WorkspaceFilter::new(std::slice::from_ref(&root), &config);
+        assert!(!baseline.admits(&selected));
+        config.filename_exception_files = config.explicit_source_files.clone();
+        let filter = WorkspaceFilter::new(std::slice::from_ref(&root), &config);
+        assert!(filter.admits(&selected));
+        for path in [&sibling, &mixed, &hidden, &private, &unsupported, &oversized] { assert!(!filter.admits(path)); }
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside_secret.rs");
+        std::fs::write(&outside_file, "pub fn outside() {}\n").unwrap();
+        config.explicit_source_files.push(outside_file.clone());
+        config.filename_exception_files.push(outside_file.clone());
+        assert!(!WorkspaceFilter::new(std::slice::from_ref(&root), &config).admits(&outside_file));
+        #[cfg(unix)] {
+            let link = root.join("linked_secret.rs");
+            std::os::unix::fs::symlink(&selected, &link).unwrap();
+            config.explicit_source_files.push(link.clone());
+            config.filename_exception_files.push(link.clone());
+            assert!(!WorkspaceFilter::new(std::slice::from_ref(&root), &config).admits(&link));
+        }
+        let parsers = Arc::new(ParserRegistry::new());
+        let state = Arc::new(Mutex::new(IndexState::for_workspace("filename-exception-test", &root)));
+        let indexer = Indexer::new(parsers, state.clone());
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        indexer.index_workspace(&graph, std::slice::from_ref(&root), &config).await;
+        let checkpoint = state.lock().await;
+        assert!(checkpoint.get_hash(&selected).is_some());
+        assert!(checkpoint.get_hash(&sibling).is_none());
+        assert!(checkpoint.get_hash(&mixed).is_none());
+        assert!(checkpoint.save());
+        drop(checkpoint);
+        let mut restored = IndexState::for_workspace("filename-exception-test", &root);
+        assert!(restored.load() > 0);
+        assert!(restored.get_hash(&selected).is_some());
+        assert!(restored.get_hash(&sibling).is_none());
+        state.lock().await.remove(&selected);
+        assert!(graph.read().await.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("selected_marker")));
+        let foreign_id = graph.write().await.add_node(codegraph::NodeType::Function,
+            codegraph::PropertyMap::new().with("path", outside_file.to_string_lossy().to_string())).unwrap();
+        let narrowed = indexer.index_workspace(&graph, std::slice::from_ref(&root), &config).await;
+        assert!(narrowed.failure().is_some());
+        graph.write().await.delete_node(foreign_id).unwrap();
+        config.filename_exception_files.clear();
+        let moved = root.with_extension("offline");
+        std::fs::rename(&root, &moved).unwrap();
+        let unavailable = indexer.index_workspace(&graph, std::slice::from_ref(&root), &config).await;
+        assert!(unavailable.failure().is_some());
+        if root.exists() { std::fs::remove_dir_all(&root).unwrap(); }
+        std::fs::rename(&moved, &root).unwrap();
+        std::fs::remove_file(&selected).unwrap();
+        indexer.index_workspace(&graph, std::slice::from_ref(&root), &config).await;
+        assert!(state.lock().await.get_hash(&selected).is_none());
+        assert!(!graph.read().await.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("selected_marker")));
     }
 
     #[test]
@@ -2590,6 +2802,7 @@ mod tests {
             max_files: 100,
             explicit_source_files: vec![],
             exact_cpp_files: vec![],
+            filename_exception_files: vec![],
             explicit_source_extensions: vec![],
         };
         config.extend_from_codegraphignore(tmp.path());
