@@ -54,6 +54,10 @@ struct Args {
     #[arg(long = "include-file", value_name = "PATH")]
     include_files: Vec<PathBuf>,
 
+    /// Exact source file exempted from secret/credential filename globs only.
+    #[arg(long = "include-filename-exception", value_name = "PATH")]
+    filename_exception_files: Vec<PathBuf>,
+
     /// Exact in-workspace file to parse as C++, regardless of its suffix.
     #[arg(long = "include-cpp-file", value_name = "PATH")]
     include_cpp_files: Vec<PathBuf>,
@@ -406,6 +410,13 @@ async fn run() {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
+    if !args.filename_exception_files.is_empty()
+        && (args.connect || args.serve || args.watch || (!args.mcp && args.run_tool.is_none()))
+    {
+        eprintln!("Filename exceptions require direct MCP or run-tool mode");
+        std::process::exit(2);
+    }
+
     // Thin MCP client (Model B): relay this process's stdio to a running engine.
     // No indexing, no model. Handled before the global signal hook; it exits
     // when the agent closes stdin or the engine drops the connection.
@@ -509,6 +520,8 @@ async fn run() {
         }
         .with_split_identifiers(args.split_identifiers)
         .with_explicit_source_files(args.include_files.clone())
+        .with_filename_exception_files(args.filename_exception_files.clone())
+        .unwrap_or_else(|error| { eprintln!("Invalid filename exception: {error}"); std::process::exit(2) })
         .with_exact_cpp_files(args.include_cpp_files.clone())
         .unwrap_or_else(|error| { eprintln!("Invalid C++ file override: {error}"); std::process::exit(2) })
         .with_graph_only(args.graph_only);
@@ -595,6 +608,8 @@ async fn run() {
         )
         .with_split_identifiers(args.split_identifiers)
         .with_explicit_source_files(args.include_files)
+        .with_filename_exception_files(args.filename_exception_files)
+        .unwrap_or_else(|error| { eprintln!("Invalid filename exception: {error}"); std::process::exit(2) })
         .with_exact_cpp_files(args.include_cpp_files)
         .unwrap_or_else(|error| { eprintln!("Invalid C++ file override: {error}"); std::process::exit(2) })
         .with_tool_profile(tool_profile)

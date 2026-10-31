@@ -1031,6 +1031,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn filename_exception_refreshes_only_selected_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let selected = root.join("source_secret.rs");
+        let sibling = root.join("other_secret.rs");
+        std::fs::write(&selected, "pub fn before_selected() {}\n").unwrap();
+        std::fs::write(&sibling, "pub fn ignored_sibling() {}\n").unwrap();
+        let parsers = Arc::new(ParserRegistry::new());
+        let indexer = test_indexer(&root, &parsers);
+        let config = IndexConfig { explicit_source_files: vec![selected.clone()], filename_exception_files: vec![selected.clone()], explicit_source_extensions: vec!["rs".into()], exclude_patterns: vec!["**/*secret*".into()], ..IndexConfig::default() };
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        indexer.index_workspace(&graph, std::slice::from_ref(&root), &config).await;
+        wait_for_name(&graph, "before_selected", true).await;
+        let query_engine = Arc::new(QueryEngine::new(Arc::clone(&graph)));
+        let _watcher = McpFileWatcher::start(Arc::clone(&graph), parsers, query_engine, indexer, Arc::new(|_| Ok(())), std::slice::from_ref(&root), &config).await.unwrap();
+        std::fs::write(&selected, "pub fn after_selected() {}\n").unwrap();
+        std::fs::write(&sibling, "pub fn changed_sibling() {}\n").unwrap();
+        wait_for_name(&graph, "after_selected", true).await;
+        wait_for_name(&graph, "before_selected", false).await;
+        wait_for_name(&graph, "changed_sibling", false).await;
+        std::fs::remove_file(&selected).unwrap();
+        wait_for_name(&graph, "after_selected", false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exact_cpp_override_stays_fresh_after_edit() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("project");

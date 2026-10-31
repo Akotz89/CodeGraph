@@ -587,6 +587,8 @@ Add an entire directory alongside existing data.
 }
 ```
 
+External directories added with `index_directory` are recorded in the graph and rechecked against current exclusions on restart. Older graphs may contain external files without this record; they fail closed at startup. To migrate one, use `reindex_workspace` with `force: true` to rebuild the workspace graph, then run `index_directory` again for each external directory you still want. The forced rebuild replaces the existing graph, so re-add all desired external directories.
+
 ### Workspace exclusion: `.codegraphignore` + default skip list
 
 Initial indexing, `reindex_workspace`, `index_directory` and the file watcher honor a per-folder `.codegraphignore` file (gitignore-like syntax — one pattern per line, `#` comments, blank lines ignored; no `!` negation in v1) plus a built-in skip list for binary archives, compiled artifacts, OS metadata, and bulky non-source:

@@ -10,6 +10,16 @@
 // npm wrapper — no network calls happen in the Rust binary.
 use crate::telemetry::emit_tel;
 
+fn graph_has_excluded_paths(graph: &codegraph::CodeGraph, filter: &crate::indexer::WorkspaceFilter, external: &crate::indexer::WorkspaceFilter) -> bool {
+    let mut checked = std::collections::HashSet::new();
+    graph.iter_nodes().any(|(_, node)| {
+        node.properties.get_string("path").is_some_and(|path| {
+            let path = std::path::Path::new(path);
+            checked.insert(path) && !filter.admits(path) && (filter.covers(path) || !external.admits(path))
+        })
+    })
+}
+
 /// Map a raw tool-error string to a coarse, allowlisted class. The raw
 /// message MUST NOT be emitted — it routinely contains file paths and
 /// usernames (e.g. "No symbols found in 'file:///Users/<name>/...'").
@@ -120,6 +130,7 @@ pub struct McpBackend {
     /// even when their parent is an excluded example/distribution directory.
     pub explicit_source_files: Vec<PathBuf>,
     pub exact_cpp_files: Vec<PathBuf>,
+    pub filename_exception_files: Vec<PathBuf>,
     /// Shared indexer for directory walking and file parsing
     pub indexer: Arc<Indexer>,
     /// Index state for hash persistence (shared with indexer)
@@ -299,6 +310,7 @@ impl McpBackend {
             max_files,
             explicit_source_files: Vec::new(),
             exact_cpp_files: Vec::new(),
+            filename_exception_files: Vec::new(),
             indexer,
             index_state,
             last_graph_persist_succeeded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1035,6 +1047,7 @@ impl McpBackend {
             max_files: self.max_files,
             explicit_source_files: self.explicit_source_files.clone(),
             exact_cpp_files: self.exact_cpp_files.clone(),
+            filename_exception_files: self.filename_exception_files.clone(),
             explicit_source_extensions: self
                 .parsers
                 .supported_extensions()
@@ -1434,9 +1447,10 @@ impl McpBackend {
             }
         }
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let index_dir = if workspace.is_none() { canonical_dir.as_path() } else { dir };
         let (total, _parsed, _skipped, _by_lang, errors) = self
             .indexer
-            .index_directory(&self.graph, dir, &config, 0, counter)
+            .index_directory(&self.graph, index_dir, &config, 0, counter)
             .await;
         let failed: usize = errors.values().sum();
         if total > 0 || failed > 0 {
@@ -1455,6 +1469,14 @@ impl McpBackend {
                 self.query_engine.prune_orphan_vectors().await;
                 self.indexer.invalidate_index_state().await;
                 return Err(format!("Failed to index {failed} file(s)"));
+            }
+            if workspace.is_none() {
+                let mut graph = self.graph.write().await;
+                let root = canonical_dir.to_string_lossy().to_string();
+                if !graph.iter_nodes().any(|(_, node)| node.properties.get_string("codegraph_external_root") == Some(root.as_str())) {
+                    graph.add_node(codegraph::NodeType::Module, codegraph::PropertyMap::new().with("codegraph_external_root", root))
+                        .map_err(|error| format!("Failed to record external directory: {error}"))?;
+                }
             }
             if embed {
                 tracing::info!("Embedding symbols from {:?}...", dir);
@@ -1636,6 +1658,20 @@ impl McpServer {
         self
     }
 
+    /// Admit exact source files past the two filename-only exclusion globs.
+    pub fn with_filename_exception_files(mut self, files: Vec<PathBuf>) -> Result<Self, String> {
+        let mut config = self.backend.index_config();
+        config.filename_exception_files = files.clone();
+        config.explicit_source_files.extend(files.iter().cloned());
+        let filter = crate::indexer::WorkspaceFilter::new(&self.backend.workspace_folders, &config);
+        if files.iter().any(|path| !path.is_file() || !filter.admits(path)) {
+            return Err("filename exception failed workspace admission".into());
+        }
+        self.backend.explicit_source_files.extend(files.iter().cloned());
+        self.backend.filename_exception_files = files;
+        Ok(self)
+    }
+
     /// Admit only exact, workspace-contained C++ overrides. No extension-wide
     /// classification is performed for ambiguous include files.
     pub fn with_exact_cpp_files(mut self, files: Vec<PathBuf>) -> Result<Self, String> {
@@ -1679,6 +1715,11 @@ impl McpServer {
         // recursive watcher has no useful lifetime here and can register a
         // very large tree just before shutdown.
         self.watch_workspace = should_watch_workspace(true);
+        if !self.backend.filename_exception_files.is_empty()
+            && crate::daemon::live_daemon_for(&self.backend.project_slug).is_some()
+        {
+            return Err("Filename exceptions cannot attach to an independently configured watcher daemon".into());
+        }
         if is_forced_reindex_request(tool_name, tool_args.as_ref()) {
             // The reindex tool performs the one full parse itself. Skipping
             // ensure_indexed avoids first hashing/parsing stale workspace data.
@@ -1713,6 +1754,21 @@ impl McpServer {
         // writing + watching). This is the daemon's whole point for stateless
         // MCP sessions — warm start without the cold-start reindex.
         if let Some(d) = crate::daemon::live_daemon_for(&self.backend.project_slug) {
+            if !self.backend.filename_exception_files.is_empty() {
+                return Err("Filename exceptions cannot attach to an independently configured watcher daemon".into());
+            }
+            if self.backend.workspace_folders.iter().any(|root| std::fs::read_dir(root).is_err()) {
+                return Err("Cannot verify daemon graph for an inaccessible workspace".into());
+            }
+            let config = self.backend.index_config();
+            let filter = crate::indexer::WorkspaceFilter::new(&self.backend.workspace_folders, &config);
+            let graph = self.backend.graph.read().await;
+            let roots = crate::indexer::authorized_external_roots(&graph, &config)?;
+            let external = crate::indexer::external_filter(&roots, &config);
+            if graph_has_excluded_paths(&graph, &filter, &external) {
+                return Err("Watcher daemon graph contains paths excluded by this session's configuration".into());
+            }
+            drop(graph);
             tracing::info!(
                 "Watcher daemon (pid {}) owns this workspace — using its warm graph, skipping reindex",
                 d.pid
@@ -2082,6 +2138,27 @@ impl McpServer {
         id: Option<Value>,
         params: Option<Value>,
     ) -> JsonRpcResponse {
+        let forced = params.as_ref().is_some_and(|params| {
+            is_forced_reindex_request(params.get("name").and_then(Value::as_str).unwrap_or(""), params.get("arguments"))
+        });
+        if forced && !self.indexed {
+            if crate::daemon::live_daemon_for(&self.backend.project_slug).is_some()
+                || self.backend.workspace_folders.iter().any(|root| std::fs::read_dir(root).is_err())
+            {
+                return JsonRpcResponse::error(id, JsonRpcError::internal_error("Cannot reindex while a daemon owns the workspace or a root is inaccessible"));
+            }
+            if let Err(error) = self.backend.validate_workspace_roots() {
+                return JsonRpcResponse::error(id, JsonRpcError::internal_error(error));
+            }
+            self.indexed = true;
+            let response = self.tools_call_response(id, params).await;
+            if response.error.is_some() || response.result.as_ref().and_then(|value| value.get("isError")).and_then(Value::as_bool) == Some(true) {
+                self.indexed = false;
+            } else {
+                self.index_error = None;
+            }
+            return response;
+        }
         if let Err(error) = self.ensure_indexed().await {
             return JsonRpcResponse::error(id, JsonRpcError::internal_error(error));
         }
@@ -5413,6 +5490,122 @@ fn parse_node_id(value: &Value) -> Option<codegraph::NodeId> {
 
 #[cfg(test)]
 mod node_id_tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_directory_alias_can_disappear_after_indexing() {
+        let tmp = tempfile::Builder::new().prefix("codegraph-harness-").tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let external = tmp.path().join("external");
+        let alias = tmp.path().join("alias");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(external.join("source.rs"), "pub fn external_alias_source() {}\n").unwrap();
+        std::os::unix::fs::symlink(&external, &alias).unwrap();
+        let mut backend = super::McpBackend::new_fresh(vec![workspace.clone()], Vec::new(), 100,
+            codegraph_memory::EmbeddingBackend::default(), false);
+        backend.graph_only = true;
+        backend.add_directory_to_index(&alias, false).await.unwrap();
+        let db = tmp.path().join("snapshot.db");
+        backend.graph.read().await.persist_to(Box::new(codegraph::RocksDBBackend::open(&db).unwrap())).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        let mut restarted = super::McpBackend::new_fresh(vec![workspace], Vec::new(), 100,
+            codegraph_memory::EmbeddingBackend::default(), false);
+        restarted.graph_only = true;
+        *restarted.graph.write().await = codegraph::CodeGraph::open(&db).unwrap();
+        restarted.index_workspace().await.unwrap();
+        assert!(restarted.graph.read().await.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("external_alias_source")));
+    }
+
+    #[tokio::test]
+    async fn external_directory_survives_graph_persistence_and_restart() {
+        let temp = tempfile::Builder::new().prefix("codegraph-harness-").tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(workspace.join("source.rs"), "pub fn in_workspace() {}\n").unwrap();
+        std::fs::write(external.join("source.rs"), "pub fn external_source() {}\n").unwrap();
+        let denied = external.join("source_secret.rs");
+        std::fs::write(&denied, "pub fn external_secret() {}\n").unwrap();
+        let mut backend = super::McpBackend::new_fresh(vec![workspace.clone()], vec!["**/*secret*".into()], 100,
+            codegraph_memory::EmbeddingBackend::default(), false);
+        backend.graph_only = true;
+        backend.index_workspace().await.unwrap();
+        backend.add_directory_to_index(&external, false).await.unwrap();
+        let db = temp.path().join("snapshot.db");
+        {
+            let graph = backend.graph.read().await;
+            graph.persist_to(Box::new(codegraph::RocksDBBackend::open(&db).unwrap())).unwrap();
+        }
+        let restored = codegraph::CodeGraph::open(&db).unwrap();
+        let mut restarted = super::McpBackend::new_fresh(vec![workspace.clone()], vec!["**/*secret*".into()], 100,
+            codegraph_memory::EmbeddingBackend::default(), false);
+        restarted.graph_only = true;
+        *restarted.graph.write().await = restored;
+        restarted.index_workspace().await.unwrap();
+        let graph = restarted.graph.read().await;
+        assert!(graph.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("external_source")));
+        assert!(!graph.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("external_secret")));
+        drop(graph);
+        std::fs::write(external.join(".codegraphignore"), "**/source.rs\n").unwrap();
+        restarted.index_workspace().await.unwrap();
+        assert!(!restarted.graph.read().await.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("external_source")));
+        let server = super::McpServer::new_fresh(vec![workspace.clone()], vec!["**/*secret*".into()], 100,
+            codegraph_memory::EmbeddingBackend::default(), false);
+        assert!(server.with_filename_exception_files(vec![denied]).is_err());
+        #[cfg(unix)] {
+            std::fs::rename(&external, temp.path().join("former-external")).unwrap();
+            std::os::unix::fs::symlink(&workspace, &external).unwrap();
+            assert!(restarted.index_workspace().await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_reindex_recovers_after_out_of_scope_graph_rejection() {
+        let tmp = tempfile::Builder::new().prefix("codegraph-harness-").tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("source.rs"), "pub fn within_scope() {}\n").unwrap();
+        let external = tmp.path().join("external");
+        std::fs::create_dir(&external).unwrap();
+        let external_file = external.join("outside.rs");
+        std::fs::write(&external_file, "pub fn restored_external() {}\n").unwrap();
+        let mut server = super::McpServer::new_fresh(vec![root], Vec::new(), 100,
+            codegraph_memory::EmbeddingBackend::default(), false).with_graph_only(true);
+        server.watch_workspace = false;
+        server.backend.graph.write().await.add_node(codegraph::NodeType::Function,
+            codegraph::PropertyMap::new().with("path", external_file.to_string_lossy().to_string())).unwrap();
+        assert!(server.ensure_indexed().await.is_err());
+        let response = server.handle_tools_call(None, Some(serde_json::json!({"name":"codegraph_reindex_workspace", "arguments":{"force":true}}))).await;
+        assert!(response.error.is_none());
+        assert_ne!(response.result.as_ref().and_then(|result| result.get("isError")).and_then(serde_json::Value::as_bool), Some(true));
+        assert!(server.indexed);
+        assert!(server.backend.graph.read().await.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("within_scope")));
+        server.backend.add_directory_to_index(&external, false).await.unwrap();
+        server.backend.index_workspace().await.unwrap();
+        assert!(server.backend.graph.read().await.iter_nodes().any(|(_, node)| node.properties.get_string("name") == Some("restored_external")));
+    }
+
+    #[test]
+    fn warm_graph_rejects_revoked_filename_exception() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("source_secret.rs");
+        std::fs::write(&path, "pub fn source() {}\n").unwrap();
+        let mut graph = codegraph::CodeGraph::in_memory().unwrap();
+        graph.add_node(codegraph::NodeType::Function, codegraph::PropertyMap::new().with("path", path.to_string_lossy().to_string())).unwrap();
+        let mut config = crate::indexer::IndexConfig::default();
+        config.exclude_patterns.push("**/*secret*".into());
+        let filter = crate::indexer::WorkspaceFilter::new(&[tmp.path().to_path_buf()], &config);
+        let external = crate::indexer::external_filter(&[], &config);
+        assert!(super::graph_has_excluded_paths(&graph, &filter, &external));
+        config.explicit_source_files.push(path.clone());
+        config.filename_exception_files.push(path);
+        config.explicit_source_extensions.push("rs".into());
+        let filter = crate::indexer::WorkspaceFilter::new(&[tmp.path().to_path_buf()], &config);
+        let external = crate::indexer::external_filter(&[], &config);
+        assert!(!super::graph_has_excluded_paths(&graph, &filter, &external));
+    }
+
     use super::parse_node_id;
     use serde_json::json;
 
