@@ -283,12 +283,32 @@ pub fn ir_to_graph(
             .map_err(|e| ParserError::GraphError(e.to_string()))?;
     }
 
+    // The file scope has no PHP identifier and cannot collide with a function name.
+    node_map.insert(crate::FILE_SCOPE_CALLER.to_string(), file_id);
+
+    // A conditional declaration can define the same function more than once.
+    let mut global_function_counts = HashMap::new();
+    for function in &ir.functions {
+        if function.parent_class.is_none() {
+            *global_function_counts.entry(function.name.to_ascii_lowercase()).or_insert(0_usize) += 1;
+        }
+    }
+
     // Add call relationships
     let mut unresolved_calls: HashMap<String, Vec<String>> = HashMap::new();
+    let mut unresolved_file_calls = Vec::new();
 
     for call in &ir.calls {
         if let Some(&caller_id) = node_map.get(&call.caller) {
-            if let Some(&callee_id) = node_map.get(&call.callee) {
+            let callee_id = node_map.get(&call.callee).copied().filter(|&id| {
+                call.caller != crate::FILE_SCOPE_CALLER || (
+                    global_function_counts.get(&call.callee.to_ascii_lowercase()) == Some(&1)
+                        && graph.get_node(id).is_ok_and(|node| {
+                            node.node_type == NodeType::Function && node.properties.get_string("parent_class").is_none()
+                        })
+                )
+            });
+            if let Some(callee_id) = callee_id {
                 let edge_props = PropertyMap::new()
                     .with("call_site_line", call.call_site_line as i64)
                     .with("is_direct", call.is_direct);
@@ -296,6 +316,8 @@ pub fn ir_to_graph(
                 graph
                     .add_edge(caller_id, callee_id, EdgeType::Calls, edge_props)
                     .map_err(|e| ParserError::GraphError(e.to_string()))?;
+            } else if call.caller == crate::FILE_SCOPE_CALLER {
+                unresolved_file_calls.push(format!("{}:{}", call.call_site_line, call.callee));
             } else {
                 unresolved_calls
                     .entry(call.caller.clone())
@@ -303,6 +325,13 @@ pub fn ir_to_graph(
                     .push(call.callee.clone());
             }
         }
+    }
+    if !unresolved_file_calls.is_empty() {
+        let props = graph.get_node(file_id)
+            .map_err(|e| ParserError::GraphError(e.to_string()))?
+            .properties.clone().with("unresolved_file_calls", unresolved_file_calls);
+        graph.update_node_properties(file_id, props)
+            .map_err(|e| ParserError::GraphError(e.to_string()))?;
     }
 
     // Store unresolved calls on caller nodes for post-processing
