@@ -1020,13 +1020,18 @@ impl McpBackend {
     /// Build an [`IndexConfig`] from this backend's settings.
     fn index_config(&self) -> IndexConfig {
         let mut exclude_dirs = IndexConfig::default_exclude_dirs();
+        let mut exclude_patterns = IndexConfig::default_exclude_patterns();
         for dir in &self.exclude_dirs {
             if !exclude_dirs.contains(dir) {
                 exclude_dirs.push(dir.clone());
             }
+            if !exclude_patterns.contains(dir) {
+                exclude_patterns.push(dir.clone());
+            }
         }
         IndexConfig {
             exclude_dirs,
+            exclude_patterns,
             max_files: self.max_files,
             explicit_source_files: self.explicit_source_files.clone(),
             exact_cpp_files: self.exact_cpp_files.clone(),
@@ -1040,12 +1045,33 @@ impl McpBackend {
         }
     }
 
+    /// Explicit workspace selection does not override user-supplied exclusions.
+    fn validate_workspace_roots(&self) -> Result<(), String> {
+        for root in &self.workspace_folders {
+            let resolved = root.canonicalize().unwrap_or_else(|_| root.clone());
+            if root.ancestors().chain(resolved.ancestors()).any(|ancestor| {
+                self.exclude_dirs.iter().any(|pattern| {
+                    ancestor.file_name().is_some_and(|name| name == std::ffi::OsStr::new(pattern))
+                        || globset::Glob::new(pattern).is_ok_and(|glob| {
+                            let matcher = glob.compile_matcher();
+                            matcher.is_match(ancestor)
+                                || ancestor.file_name().is_some_and(|name| matcher.is_match(name))
+                        })
+                })
+            }) {
+                return Err("Workspace root rejected by exclude filter".to_string());
+            }
+        }
+        Ok(())
+    }
+
     /// Index the workspace. Returns (total_files, files_actually_parsed).
     pub async fn index_workspace(&self) -> Result<(usize, usize), String> {
         self.index_workspace_with_fresh_vectors(false).await
     }
 
     async fn index_workspace_with_fresh_vectors(&self, force_fresh_vectors: bool) -> Result<(usize, usize), String> {
+        self.validate_workspace_roots()?;
         let config = self.index_config();
 
         // Initialising the memory manager loads the embedding model, which is
@@ -1204,6 +1230,7 @@ impl McpBackend {
     /// Also detects and re-indexes direct dependents (files that called or
     /// imported symbols from the updated files) to keep edges consistent.
     pub async fn add_files_to_index(&self, paths: &[PathBuf]) -> Result<(usize, usize), String> {
+        self.validate_workspace_roots()?;
         crate::watcher::validate_call_scope_configuration().map_err(|error| error.to_string())?;
         let _guard = self.indexer.mcp_operation_lock.lock().await;
         if self.forced_reindex_incomplete.load(std::sync::atomic::Ordering::Acquire) {
@@ -1367,6 +1394,7 @@ impl McpBackend {
         dir: &std::path::Path,
         embed: bool,
     ) -> Result<usize, String> {
+        self.validate_workspace_roots()?;
         crate::watcher::validate_call_scope_configuration().map_err(|error| error.to_string())?;
         let _guard = self.indexer.mcp_operation_lock.lock().await;
         if self.forced_reindex_incomplete.load(std::sync::atomic::Ordering::Acquire) {
@@ -1377,7 +1405,34 @@ impl McpBackend {
             return Ok(0);
         }
 
-        let config = self.index_config();
+        let mut config = self.index_config();
+        let canonical_dir = dir.canonicalize().map_err(|error| error.to_string())?;
+        let workspace = self.workspace_folders.iter().filter(|root| {
+            dir.starts_with(root) || root.canonicalize().is_ok_and(|root| canonical_dir.starts_with(root))
+        }).max_by_key(|root| root.components().count());
+        if let Some(root) = workspace {
+            let canonical_root = root.canonicalize().map_err(|error| error.to_string())?;
+            let filter = crate::indexer::WorkspaceFilter::new(&self.workspace_folders, &config);
+            if !canonical_dir.starts_with(canonical_root) || !filter.admits_directory(dir) {
+                return Err("Directory rejected by workspace filter".to_string());
+            }
+            config.extend_from_codegraphignore(root);
+        } else {
+            config.extend_from_codegraphignore(dir);
+            let exclude_set = config.build_exclude_set();
+            let temp = std::env::temp_dir();
+            let resolved_temp = temp.canonicalize().unwrap_or_else(|_| temp.clone());
+            if dir.ancestors().chain(canonical_dir.ancestors()).any(|ancestor| {
+                exclude_set.is_match(ancestor) || ancestor.file_name().is_some_and(|name| {
+                    exclude_set.is_match(name)
+                        || self.exclude_dirs.iter().any(|excluded| name == std::ffi::OsStr::new(excluded))
+                        || (ancestor != temp && ancestor != resolved_temp
+                            && config.exclude_dirs.iter().any(|excluded| name == std::ffi::OsStr::new(excluded)))
+                })
+            }) {
+                return Err("Directory rejected by exclude filter".to_string());
+            }
+        }
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (total, _parsed, _skipped, _by_lang, errors) = self
             .indexer
@@ -1646,6 +1701,7 @@ impl McpServer {
     /// Ensure workspace is indexed (lazy — runs on first tool call, or once at
     /// engine startup before serving connections).
     pub(crate) async fn ensure_indexed(&mut self) -> Result<(), String> {
+        self.backend.validate_workspace_roots()?;
         if self.indexed {
             return Ok(());
         }
@@ -3732,6 +3788,7 @@ impl McpServer {
 
             // ==================== Admin Tools ====================
             "codegraph_reindex_workspace" => {
+                self.backend.validate_workspace_roots()?;
                 crate::watcher::validate_call_scope_configuration().map_err(|error| error.to_string())?;
                 let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
                 let _reindex_guard = self.backend.reindex_lock.lock().await;
@@ -5563,6 +5620,148 @@ mod quarantine_tests {
             codegraph_memory::EmbeddingBackend::default(), false)
             .with_explicit_source_files(vec![selected.clone()]);
         assert_eq!(server.backend.add_files_to_index(&[selected, sibling]).await.unwrap(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn mcp_exclude_globs_apply_to_index_tools_and_watcher_filter() {
+        use crate::indexer::{IndexConfig, WorkspaceFilter};
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("codegraph-harness-mcp-exclude-globs");
+        let source = workspace.join("src");
+        let build = workspace.join("build-generated");
+        let blocked = workspace.join("blocked_dir");
+        for dir in [&source, &build, &blocked] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let public = source.join("public.rs");
+        let secret = source.join("synthetic-secret.rs");
+        std::fs::write(workspace.join(".codegraphignore"), "**/*ignored*\n").unwrap();
+        std::fs::write(&public, "pub fn visible_canary() {}\n").unwrap();
+        std::fs::write(&secret, "pub fn excluded_canary() {}\n").unwrap();
+        std::fs::write(source.join("ignored.rs"), "pub fn ignored_canary() {}\n").unwrap();
+        std::fs::write(build.join("build.rs"), "pub fn excluded_build() {}\n").unwrap();
+        std::fs::write(blocked.join("blocked.rs"), "pub fn excluded_dir() {}\n").unwrap();
+        #[cfg(unix)]
+        {
+            let outside_target = temp.path().join("outside-target.rs");
+            std::fs::write(&outside_target, "pub fn excluded_symlink_file() {}\n").unwrap();
+            std::os::unix::fs::symlink(&blocked, workspace.join("alias-dir")).unwrap();
+            std::os::unix::fs::symlink(&outside_target, source.join("alias-file.rs")).unwrap();
+        }
+
+        let mut backend = McpBackend::new_fresh(
+            vec![workspace.clone()],
+            vec!["**/*secret*".into(), "build-*".into(), "blocked_dir".into()],
+            100,
+            codegraph_memory::EmbeddingBackend::default(),
+            false,
+        );
+        backend.graph_only = true;
+        let config = backend.index_config();
+        for default in IndexConfig::default_exclude_patterns() {
+            assert!(config.exclude_patterns.contains(&default));
+        }
+        let watcher_filter = WorkspaceFilter::new(std::slice::from_ref(&workspace), &config);
+        assert!(watcher_filter.admits(&public));
+        assert!(!watcher_filter.admits(&secret));
+        assert!(!watcher_filter.admits(&build.join("build.rs")));
+        assert!(!watcher_filter.admits(&blocked.join("blocked.rs")));
+
+        backend.index_workspace().await.unwrap();
+        assert_eq!(backend.add_files_to_index(&[secret]).await.unwrap(), (0, 1));
+        std::fs::create_dir_all(blocked.join("nested")).unwrap();
+        assert!(backend.add_directory_to_index(&blocked, false).await.is_err());
+        assert!(backend.add_directory_to_index(&blocked.join("nested"), false).await.is_err());
+        assert!(backend.add_directory_to_index(&build, false).await.is_err());
+        #[cfg(unix)]
+        {
+            let alias = workspace.join("alias");
+            std::os::unix::fs::symlink(&blocked, &alias).unwrap();
+            assert!(backend.add_directory_to_index(&alias, false).await.is_err());
+        }
+        let extra = workspace.join("extra");
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(extra.join("extra-secret.rs"), "pub fn excluded_extra() {}\n").unwrap();
+        std::fs::write(extra.join("extra-public.rs"), "pub fn visible_extra() {}\n").unwrap();
+        std::fs::write(extra.join("extra-ignored.rs"), "pub fn ignored_extra() {}\n").unwrap();
+        backend.add_directory_to_index(&extra, false).await.unwrap();
+        let outside = temp.path().join("external-workspace");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join(".codegraphignore"), "**/*ignored*\n").unwrap();
+        std::fs::write(outside.join("external-public.rs"), "pub fn visible_external() {}\n").unwrap();
+        std::fs::write(outside.join("external-ignored.rs"), "pub fn ignored_external() {}\n").unwrap();
+        backend.add_directory_to_index(&outside, false).await.unwrap();
+        let external_build = temp.path().join("build-generated");
+        std::fs::create_dir_all(&external_build).unwrap();
+        assert!(backend.add_directory_to_index(&external_build, false).await.is_err());
+        let external_blocked = temp.path().join("node_modules");
+        std::fs::create_dir_all(external_blocked.join("nested")).unwrap();
+        assert!(backend.add_directory_to_index(&external_blocked, false).await.is_err());
+        assert!(backend.add_directory_to_index(&external_blocked.join("nested"), false).await.is_err());
+        #[cfg(unix)]
+        {
+            let alias = temp.path().join("external-alias");
+            std::os::unix::fs::symlink(&external_blocked, &alias).unwrap();
+            assert!(backend.add_directory_to_index(&alias, false).await.is_err());
+        }
+        let graph = backend.graph.read().await;
+        let names: Vec<_> = graph.iter_nodes().filter_map(|(_, node)| node.properties.get_string("name")).collect();
+        assert!(names.contains(&"visible_canary"));
+        assert!(names.contains(&"visible_extra"));
+        assert!(names.contains(&"visible_external"));
+        for excluded in ["excluded_canary", "excluded_build", "excluded_dir", "excluded_extra", "ignored_canary", "ignored_extra", "ignored_external", "excluded_symlink_file"] {
+            assert!(!names.contains(&excluded), "indexed excluded symbol {excluded}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_explicit_workspace_does_not_override_user_exclusion() {
+        let temp = tempfile::tempdir().unwrap();
+        let private = temp.path().join("codegraph-harness-excluded").join("private");
+        std::fs::create_dir_all(&private).unwrap();
+        let source = private.join("ordinary.rs");
+        std::fs::write(&source, "pub fn private_canary() {}\n").unwrap();
+        let mut backend = McpBackend::new_fresh(
+            vec![private.clone()], vec!["private".into()], 100,
+            codegraph_memory::EmbeddingBackend::default(), false,
+        );
+        backend.graph_only = true;
+        assert!(backend.index_workspace().await.is_err());
+        assert!(backend.add_files_to_index(std::slice::from_ref(&source)).await.is_err());
+        assert!(backend.add_directory_to_index(&private, false).await.is_err());
+        let mut server = McpServer::new_fresh(
+            vec![private.clone()], vec!["private".into()], 100,
+            codegraph_memory::EmbeddingBackend::default(), false,
+        ).with_graph_only(true);
+        server.indexed = true;
+        assert!(server.ensure_indexed().await.is_err());
+        {
+            let mut state = server.backend.index_state.lock().await;
+            state.set_hash(source, 42);
+            assert!(state.save());
+        }
+        let state_file = private.join(".codegraph-state/index_state.json");
+        let original_state = std::fs::read(&state_file).unwrap();
+        {
+            let mut graph = server.backend.graph.write().await;
+            graph.add_node(codegraph::NodeType::Function,
+                codegraph::PropertyMap::new().with("name", "retained_canary")).unwrap();
+        }
+        assert!(server.execute_tool("codegraph_reindex_workspace", Some(serde_json::json!({"force": true}))).await.is_err());
+        assert_eq!(std::fs::read(state_file).unwrap(), original_state);
+        assert!(server.backend.graph.read().await.iter_nodes().any(|(_, node)|
+            node.properties.get_string("name") == Some("retained_canary")));
+
+        let hidden = temp.path().join("codegraph-harness-hidden").join(".explicit-root");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(hidden.join("source.rs"), "pub fn allowed_hidden_root() {}\n").unwrap();
+        let mut allowed = McpBackend::new_fresh(
+            vec![hidden], Vec::new(), 100,
+            codegraph_memory::EmbeddingBackend::default(), false,
+        );
+        allowed.graph_only = true;
+        assert!(allowed.index_workspace().await.is_ok());
     }
 
     #[tokio::test]
