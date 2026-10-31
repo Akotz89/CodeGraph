@@ -177,6 +177,10 @@ pub fn extract(
 
     let mut visitor = PhpVisitor::new(source.as_bytes());
     visitor.visit_node(root_node);
+    // shortcut: file-scope import aliases need name resolution before calls can be linked safely.
+    if visitor.has_namespace_import {
+        visitor.calls.retain(|call| call.caller != crate::FILE_SCOPE_CALLER);
+    }
 
     ir.functions = visitor.functions;
     ir.classes = visitor.classes;
@@ -192,6 +196,13 @@ pub fn extract(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_scope_calls_with_imports_are_not_guessed() {
+        let source = "<?php\nuse function Other\\target as target;\ntarget();\n";
+        let ir = extract(source, Path::new("caller.php"), &ParserConfig::default()).unwrap();
+        assert!(ir.calls.iter().all(|call| call.caller != crate::FILE_SCOPE_CALLER));
+    }
 
     #[test]
     fn parses_keyword_named_argument_but_rejects_bad_syntax() {

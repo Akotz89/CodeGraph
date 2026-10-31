@@ -1650,7 +1650,7 @@ impl QueryEngine {
         let caller_index = self.caller_index.read().await;
         let graph = self.graph.read().await;
 
-        self.get_call_chain(&graph, &caller_index, node_id, depth)
+        self.get_call_chain(&graph, &caller_index, node_id, depth, true)
     }
 
     /// Get direct callees of a function.
@@ -1658,7 +1658,7 @@ impl QueryEngine {
         let callee_index = self.callee_index.read().await;
         let graph = self.graph.read().await;
 
-        self.get_call_chain(&graph, &callee_index, node_id, depth)
+        self.get_call_chain(&graph, &callee_index, node_id, depth, false)
     }
 
     /// Traverse the graph from a starting node with filters.
@@ -1803,8 +1803,8 @@ impl QueryEngine {
         let symbol = self.node_to_symbol_info(&graph, node_id)?;
 
         // Get callers and callees
-        let callers = self.get_call_chain(&graph, &caller_index, node_id, 1);
-        let callees = self.get_call_chain(&graph, &callee_index, node_id, 1);
+        let callers = self.get_call_chain(&graph, &caller_index, node_id, 1, true);
+        let callees = self.get_call_chain(&graph, &callee_index, node_id, 1, false);
 
         // Count references
         let reference_count = graph
@@ -2416,44 +2416,90 @@ impl QueryEngine {
         index: &HashMap<NodeId, Vec<NodeId>>,
         start: NodeId,
         max_depth: u32,
+        callers: bool,
     ) -> Vec<CallInfo> {
         let mut results = Vec::new();
         let mut visited = HashSet::new();
-        let mut queue: VecDeque<(NodeId, u32)> = VecDeque::new();
+        let mut reported_file_edges = HashSet::new();
+        let mut queue: VecDeque<(NodeId, NodeId, u32)> = VecDeque::new();
 
         if let Some(direct) = index.get(&start) {
             for &node_id in direct {
-                queue.push_back((node_id, 1));
+                queue.push_back((node_id, start, 1));
             }
         }
 
-        while let Some((current, depth)) = queue.pop_front() {
-            if depth > max_depth || visited.contains(&current) {
+        while let Some((current, parent, depth)) = queue.pop_front() {
+            if depth > max_depth {
                 continue;
             }
-            visited.insert(current);
+            let file_caller = callers
+                && graph.get_node(current).is_ok_and(|node| node.node_type == NodeType::CodeFile);
+            let first_visit = visited.insert(current);
+            // A file can call multiple nodes in a converging chain; report each
+            // edge while expanding the file at most once to keep cycles bounded.
+            if file_caller {
+                if !reported_file_edges.insert((current, parent)) {
+                    continue;
+                }
+            } else if !first_visit {
+                continue;
+            }
 
             if let Some(symbol) = self.node_to_symbol_info(graph, current) {
                 // Check edge properties for ops struct metadata
                 let (via_ops_struct, ops_field) =
                     Self::get_ops_struct_from_edge(graph, current, start);
 
-                results.push(CallInfo {
-                    node_id: current,
-                    symbol: symbol.clone(),
-                    call_site: symbol.location.clone(),
-                    depth,
-                    via_ops_struct,
-                    ops_field,
-                });
+                let mut lines = Vec::new();
+                if file_caller {
+                    if let Ok(edges) = graph.get_edges_between(current, parent) {
+                        for id in edges {
+                            if let Ok(edge) = graph.get_edge(id) {
+                                if edge.edge_type == EdgeType::Calls {
+                                    if let Some(line) = edge.properties.get_int("call_site_line")
+                                        .and_then(|line| u32::try_from(line).ok())
+                                        .filter(|line| *line > 0)
+                                    {
+                                        lines.push(line);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                lines.sort_unstable();
+                lines.dedup();
+                let has_call_sites = !lines.is_empty();
+                if !has_call_sites {
+                    lines.push(symbol.location.line);
+                }
+                for line in lines {
+                    let mut call_site = symbol.location.clone();
+                    if has_call_sites {
+                        call_site.line = line;
+                        call_site.end_line = line;
+                    }
+                    results.push(CallInfo {
+                        node_id: current,
+                        symbol: symbol.clone(),
+                        call_site,
+                        depth,
+                        via_ops_struct: via_ops_struct.clone(),
+                        ops_field: ops_field.clone(),
+                    });
+                }
             }
 
             // Continue to next depth if needed
-            if depth < max_depth {
+            if first_visit && depth < max_depth {
                 if let Some(next_level) = index.get(&current) {
                     for &node_id in next_level {
-                        if !visited.contains(&node_id) {
-                            queue.push_back((node_id, depth + 1));
+                        let new_file_edge = callers
+                            && !reported_file_edges.contains(&(node_id, current))
+                            && graph.get_node(node_id).is_ok_and(|node| node.node_type == NodeType::CodeFile);
+                        if !visited.contains(&node_id) || new_file_edge {
+                            queue.push_back((node_id, current, depth + 1));
                         }
                     }
                 }
@@ -3899,6 +3945,139 @@ mod tests {
             "funcC should not be reachable via Imports edge when filtering for Calls"
         );
         assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn php_file_scope_callers_report_each_call_site() {
+        use codegraph_parser_api::CodeParser;
+
+        let (engine, graph) = create_test_engine().await;
+        let path = "/workspace/target.php";
+        let source = "<?php\nfunction target() {}\nif (true) {\n    target();\n    target();\n}\nfunction inside() {\n    target();\n}\n$fn = function () { target(); };\n";
+        let target;
+        {
+            let mut graph = graph.write().await;
+            codegraph_php::PhpParser::new()
+                .parse_source(source, std::path::Path::new(path), &mut graph)
+                .unwrap();
+            // MCP line coordinates are zero-based; graph locations are one-based.
+            let (id, fallback) =
+                crate::domain::node_resolution::find_nearest_node(&graph, path, 1).unwrap();
+            assert!(!fallback);
+            assert_eq!(node_props::name(graph.get_node(id).unwrap()), "target");
+            target = id;
+        }
+        engine.build_indexes().await;
+        let callers = engine.get_callers(target, 1).await;
+        let mut file_lines: Vec<_> = callers
+            .iter()
+            .filter(|call| call.symbol.kind == "CodeFile")
+            .map(|call| (call.call_site.line, call.call_site.end_line, call.call_site.file.as_str()))
+            .collect();
+        file_lines.sort_unstable();
+        assert_eq!(file_lines, vec![(4, 4, path), (5, 5, path)]);
+        let named: Vec<_> = callers.iter().filter(|call| call.symbol.name == "inside").collect();
+        assert_eq!(named.len(), 1);
+        assert_eq!((named[0].call_site.line, named[0].call_site.end_line), (7, 9));
+        assert_eq!(callers.len(), 3); // The anonymous function remains intentionally unindexed.
+    }
+
+    #[tokio::test]
+    async fn php_file_scope_cross_file_calls_remain_unresolved() {
+        use codegraph_parser_api::CodeParser;
+
+        let (engine, graph) = create_test_engine().await;
+        let parser = codegraph_php::PhpParser::new();
+        let target;
+        {
+            let mut graph = graph.write().await;
+            let caller = parser.parse_source(
+                "<?php\ntarget();\nif (true) {\n    target();\n}\n",
+                std::path::Path::new("/workspace/caller.php"), &mut graph,
+            ).unwrap();
+            let callee = parser.parse_source(
+                "<?php\nfunction target() {}\n", std::path::Path::new("/other/callee.php"), &mut graph,
+            ).unwrap();
+            target = callee.functions[0];
+            let file = graph.get_node(caller.file_id).unwrap();
+            let unresolved = file.properties.get_string_list_compat("unresolved_file_calls").unwrap();
+            assert_eq!(unresolved, vec!["2:target".to_string(), "4:target".to_string()]);
+            crate::watcher::GraphUpdater::resolve_cross_file_imports(&mut graph).unwrap();
+            assert!(graph.get_edges_between(caller.file_id, target).unwrap().is_empty());
+        }
+        engine.build_indexes().await;
+        assert!(engine.get_callers(target, 1).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn php_file_scope_does_not_bind_methods_to_global_functions() {
+        use codegraph_parser_api::CodeParser;
+
+        let (engine, graph) = create_test_engine().await;
+        let target;
+        {
+            let mut graph = graph.write().await;
+            let info = codegraph_php::PhpParser::new().parse_source(
+                "<?php\nfunction target() {}\n$obj->target();\nThing::target();\n$callback();\ntarget();\n",
+                std::path::Path::new("/workspace/caller.php"), &mut graph,
+            ).unwrap();
+            target = info.functions[0];
+        }
+        engine.build_indexes().await;
+        let callers = engine.get_callers(target, 1).await;
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].call_site.line, 6);
+    }
+
+    #[tokio::test]
+    async fn php_file_scope_does_not_guess_conditional_duplicate_functions() {
+        use codegraph_parser_api::CodeParser;
+
+        let (engine, graph) = create_test_engine().await;
+        let functions;
+        {
+            let mut graph = graph.write().await;
+            let info = codegraph_php::PhpParser::new().parse_source(
+                "<?php\nif ($condition) { function target() {} } else { function TARGET() {} }\ntarget();\n",
+                std::path::Path::new("/workspace/conditional.php"), &mut graph,
+            ).unwrap();
+            assert_eq!(info.functions.len(), 2);
+            let file = graph.get_node(info.file_id).unwrap();
+            assert_eq!(file.properties.get_string_list_compat("unresolved_file_calls").unwrap(), vec!["3:target".to_string()]);
+            functions = info.functions;
+        }
+        engine.build_indexes().await;
+        for function in functions {
+            assert!(engine.get_callers(function, 1).await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn php_file_scope_converging_callers_preserve_sites_without_cycles() {
+        use codegraph_parser_api::CodeParser;
+
+        let (engine, graph) = create_test_engine().await;
+        let path = "/workspace/converging.php";
+        let source = "<?php\nfunction target() {}\nfunction left() { target(); right(); }\nfunction right() { target(); left(); }\nleft();\nright();\n";
+        let target;
+        {
+            let mut graph = graph.write().await;
+            codegraph_php::PhpParser::new()
+                .parse_source(source, std::path::Path::new(path), &mut graph)
+                .unwrap();
+            target = crate::domain::node_resolution::find_nearest_node(&graph, path, 1).unwrap().0;
+        }
+        engine.build_indexes().await;
+        let callers = engine.get_callers(target, 10).await;
+        let mut file_lines: Vec<_> = callers.iter()
+            .filter(|call| call.symbol.kind == "CodeFile")
+            .map(|call| call.call_site.line)
+            .collect();
+        file_lines.sort_unstable();
+        assert_eq!(file_lines, vec![5, 6]);
+        assert_eq!(callers.iter().filter(|call| call.symbol.name == "left").count(), 1);
+        assert_eq!(callers.iter().filter(|call| call.symbol.name == "right").count(), 1);
+        assert_eq!(callers.len(), 4);
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@ pub struct PhpVisitor<'a> {
     pub calls: Vec<CallRelation>,
     pub inheritance: Vec<InheritanceRelation>,
     pub implementations: Vec<ImplementationRelation>,
+    pub(crate) has_namespace_import: bool,
     current_namespace: Option<String>,
     current_class: Option<String>,
     current_function: Option<String>,
@@ -36,6 +37,7 @@ impl<'a> PhpVisitor<'a> {
             calls: Vec::new(),
             inheritance: Vec::new(),
             implementations: Vec::new(),
+            has_namespace_import: false,
             current_namespace: None,
             current_class: None,
             current_function: None,
@@ -81,6 +83,7 @@ impl<'a> PhpVisitor<'a> {
                 true // Recurse to find declarations inside namespace
             }
             "namespace_use_declaration" => {
+                self.has_namespace_import = true;
                 self.visit_use(node);
                 false
             }
@@ -91,7 +94,7 @@ impl<'a> PhpVisitor<'a> {
                 self.visit_include_require(node);
                 false
             }
-            "anonymous_function_creation_expression" | "arrow_function" => {
+            "anonymous_function" | "anonymous_function_creation_expression" | "arrow_function" => {
                 false // Skip anonymous functions
             }
             // Call expressions - extract call relationships
@@ -685,14 +688,14 @@ impl<'a> PhpVisitor<'a> {
     fn extract_use_clause(&mut self, node: Node) {
         let mut cursor = node.walk();
         let mut imported = String::new();
-        let mut alias = None;
+        let mut alias = node.child_by_field_name("alias").map(|name| self.node_text(name));
 
         for child in node.children(&mut cursor) {
             match child.kind() {
-                "qualified_name" | "name" => {
+                "qualified_name" | "name" if imported.is_empty() => {
                     imported = self.node_text(child);
                 }
-                "namespace_aliasing_clause" => {
+                "namespace_aliasing_clause" if alias.is_none() => {
                     // Extract alias from "as Alias" clause
                     let mut alias_cursor = child.walk();
                     for alias_child in child.children(&mut alias_cursor) {
@@ -722,11 +725,27 @@ impl<'a> PhpVisitor<'a> {
 
     /// Visit a call expression and extract the call relationship
     fn visit_call_expression(&mut self, node: Node) {
-        // Only record calls if we're inside a function/method
-        let caller = match &self.current_function {
-            Some(name) => name.clone(),
-            None => return,
-        };
+        if node.child_by_field_name("arguments").is_some_and(|arguments| {
+            let mut cursor = arguments.walk();
+            let is_callable = arguments.named_children(&mut cursor)
+                .any(|child| child.kind() == "variadic_placeholder");
+            is_callable
+        }) {
+            return;
+        }
+        if self.current_function.is_none() {
+            // shortcut: skip ambiguous file-scope calls until target resolution is supported.
+            if self.current_namespace.is_some()
+                || node.kind() != "function_call_expression"
+                || !node.child_by_field_name("function").is_some_and(|name| name.kind() == "name")
+            {
+                return;
+            }
+        }
+        let caller = self
+            .current_function
+            .clone()
+            .unwrap_or_else(|| crate::FILE_SCOPE_CALLER.to_string());
 
         let callee = self.extract_callee_name(node);
 
@@ -808,6 +827,7 @@ impl<'a> PhpVisitor<'a> {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             match child.kind() {
+                "anonymous_function" | "anonymous_function_creation_expression" | "arrow_function" => {}
                 "function_call_expression"
                 | "member_call_expression"
                 | "scoped_call_expression" => {
@@ -1247,6 +1267,14 @@ mod tests {
     }
 
     #[test]
+    fn test_visitor_simple_use_with_alias() {
+        let visitor = parse_and_visit(b"<?php\nuse Widget as LocalWidget;");
+        assert_eq!(visitor.imports.len(), 1);
+        assert_eq!(visitor.imports[0].imported, "Widget");
+        assert_eq!(visitor.imports[0].alias.as_deref(), Some("LocalWidget"));
+    }
+
+    #[test]
     fn test_visitor_trait_use() {
         let source =
             b"<?php\ntrait Loggable {}\nclass Logger { use Loggable; public function log(): void {} }";
@@ -1365,6 +1393,44 @@ function process($x) {}
             .calls
             .iter()
             .any(|c| c.caller == "outer" && c.callee == "helper"));
+    }
+
+    #[test]
+    fn file_scope_calls_do_not_inherit_function_context() {
+        let source = b"<?php\nfunction target() {}\nif (true) { target(); }\nfunction caller() { target(); }\n$fn = function () { target(); };\n";
+        let visitor = parse_and_visit(source);
+        assert_eq!(visitor.calls.len(), 2);
+        assert!(visitor.calls.iter().any(|call| {
+            call.caller == crate::FILE_SCOPE_CALLER && call.callee == "target" && call.call_site_line == 3
+        }));
+        assert!(visitor.calls.iter().any(|call| {
+            call.caller == "caller" && call.callee == "target" && call.call_site_line == 4
+        }));
+    }
+
+    #[test]
+    fn closure_calls_are_not_attributed_to_enclosing_scope() {
+        let source = b"<?php\nfunction target() {}\n$fn = function () { target(); };\n$arrow = fn() => target();\nfunction outer() { $fn = function () { target(); }; $arrow = fn() => target(); target(); }\n";
+        let visitor = parse_and_visit(source);
+        assert_eq!(visitor.calls.len(), 1);
+        assert_eq!(visitor.calls[0].caller, "outer");
+        assert_eq!(visitor.calls[0].callee, "target");
+        assert_eq!(visitor.calls[0].call_site_line, 5);
+    }
+
+    #[test]
+    fn first_class_callable_is_not_a_call_but_argument_unpacking_is() {
+        let source = b"<?php\nfunction target(...$args) {}\n$ref = target(...);\ntarget(...$args);\nfunction caller($args) { $ref = target(...); target(...$args); }\n";
+        let visitor = parse_and_visit(source);
+        assert_eq!(visitor.calls.len(), 2);
+        assert!(visitor.calls.iter().any(|call| call.caller == crate::FILE_SCOPE_CALLER && call.callee == "target" && call.call_site_line == 4));
+        assert!(visitor.calls.iter().any(|call| call.caller == "caller" && call.callee == "target" && call.call_site_line == 5));
+    }
+
+    #[test]
+    fn file_scope_namespaced_calls_are_not_guessed() {
+        let visitor = parse_and_visit(b"<?php\nnamespace A;\ntarget();\n");
+        assert!(visitor.calls.is_empty());
     }
 
     #[test]

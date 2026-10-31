@@ -39,6 +39,9 @@ mod mapper;
 mod parser_impl;
 mod visitor;
 
+// PHP identifiers cannot be empty; this marks calls made by the file itself.
+const FILE_SCOPE_CALLER: &str = "";
+
 // Re-export parser-api types for convenience
 pub use codegraph_parser_api::{
     CodeParser, FileInfo, ParserConfig, ParserError, ParserMetrics, ProjectInfo,
